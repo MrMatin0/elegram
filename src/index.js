@@ -1,13 +1,11 @@
 import fs from 'node:fs/promises';
-import path from 'node:path';
 import { createRequire } from 'node:module';
-import { TelegramClient } from 'teleproto';
-import { StringSession } from 'teleproto/sessions';
-import { config, configIssues } from './config.js';
+import { config, configIssues, configSummary } from './config.js';
 import { Store } from './store.js';
 import { startHealthServer, stopHealthServer } from './server.js';
 import { registerHandlers } from './handlers/messages.js';
-import { log, errText } from './utils/logger.js';
+import { connect, createClient, SessionError } from './services/client.js';
+import { log, errText, setLogLevel } from './utils/logger.js';
 
 const pkg = createRequire(import.meta.url)('../package.json');
 
@@ -22,66 +20,62 @@ async function bootstrap() {
     for (const issue of issues) log.error(issue);
     process.exit(1);
   }
+  setLogLevel(config.logLevel);
 
-  log.info(`⚡️ Elegram v${pkg.version} — Node ${process.version}`);
-  const tmpDir = path.join(config.dataDir, 'tmp');
-  await resetTmpDir(tmpDir);
+  log.info(`\u26A1\uFE0F Elegram v${pkg.version} — Node ${process.version}`);
+  log.debug('[config]', JSON.stringify(configSummary()));
 
+  await resetTmpDir(config.tmpDir);
   const store = new Store(config.dataDir);
+
   const ctx = {
     client: null,
     store,
     me: null,
     queue: null,
     archiver: null,
+    version: pkg.version,
     startedAt: Date.now(),
     connected: false,
   };
 
-  // The health endpoint comes up before Telegram so platform probes (Railway)
-  // do not fail while the client is still connecting.
-  const server = startHealthServer(config.port, () => ({
-    status: ctx.connected ? 'ok' : 'starting',
-    uptime: Math.floor(process.uptime()),
-    user: ctx.me ? ctx.me.username ?? String(ctx.me.id) : null,
-    queue: ctx.queue?.pending ?? 0,
-    running: ctx.queue?.running ?? 0,
-    archived: store.data.stats.archived,
-    // State of the MTProto socket itself, not just of this HTTP process.
-    socket: ctx.client?.connected ?? false,
-  }));
+  let shuttingDown = false;
+  let shutdown = async () => {};
 
-  const client = new TelegramClient(
-    new StringSession(config.session),
-    config.apiId,
-    config.apiHash,
-    {
-      deviceModel: config.deviceModel,
-      systemVersion: 'linux',
-      appVersion: pkg.version,
-      connectionRetries: 5,
-      retryDelay: 2000,
-      autoReconnect: true,
-      requestRetries: 3,
-    },
+  // The health endpoint comes up before Telegram so a platform probe (Railway,
+  // Fly, K8s) does not fail while the MTProto socket is still connecting.
+  const server = startHealthServer(
+    config.port,
+    () => ({
+      status: ctx.connected ? 'ok' : 'starting',
+      version: pkg.version,
+      uptime: Math.floor(process.uptime()),
+      user: ctx.me ? ctx.me.username ?? String(ctx.me.id) : null,
+      queue: ctx.queue?.pending ?? 0,
+      running: ctx.queue?.running ?? 0,
+      archived: store.data.stats.archived,
+      bytes: store.data.stats.bytes,
+      failed: store.data.stats.failed,
+      autoChats: store.autoCount,
+      // State of the socket itself, not just of this HTTP process.
+      socket: Boolean(ctx.client?.connected),
+    }),
+    { onFatal: () => shutdown('HEALTH_SERVER_FAILED', 1) },
   );
+
+  const client = createClient(config, { appVersion: pkg.version });
   ctx.client = client;
 
   log.info('در حال اتصال به تلگرام…');
-  await client.connect();
-  if (!(await client.isUserAuthorized())) {
-    throw new Error('SESSION نامعتبر یا منقضی است. دوباره `npm run login` را اجرا کن.');
-  }
-  ctx.me = await client.getMe();
+  ctx.me = await connect(client, { catchUp: config.catchUp });
   ctx.connected = true;
   log.ok(`ورود موفق: @${ctx.me.username ?? ctx.me.id} (${ctx.me.firstName ?? ''})`);
 
-  registerHandlers(ctx);
+  registerHandlers(ctx, config);
 
-  let stopping = false;
-  const shutdown = async (signal) => {
-    if (stopping) return;
-    stopping = true;
+  shutdown = async (signal, code = 0) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     ctx.connected = false;
     log.warn(`${signal} دریافت شد؛ خاموشی امن…`);
     try {
@@ -89,24 +83,32 @@ async function bootstrap() {
       store.flush();
       await stopHealthServer(server);
       await client.disconnect();
+      await Promise.resolve(client.destroy?.()).catch(() => {});
     } catch (error) {
       log.error('خطا در خاموشی:', errText(error));
+    } finally {
+      await fs.rm(config.tmpDir, { recursive: true, force: true }).catch(() => {});
+      process.exit(code);
     }
-    process.exit(0);
   };
 
-  process.once('SIGINT', () => shutdown('SIGINT'));
-  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  process.once('SIGINT', () => void shutdown('SIGINT'));
+  process.once('SIGTERM', () => void shutdown('SIGTERM'));
 
   process.on('unhandledRejection', (reason) => {
     log.error('Promise رد شده بدون هندلر:', errText(reason));
   });
+
+  // A process that keeps running after an uncaught exception is a process in an
+  // unknown state. Log it, flush the store, and let the supervisor restart us.
   process.on('uncaughtException', (error) => {
     log.error('خطای غیرمنتظره:', errText(error));
+    void shutdown('UNCAUGHT_EXCEPTION', 1);
   });
 }
 
 bootstrap().catch((error) => {
-  log.error('خطای راه‌اندازی:', errText(error));
+  if (error instanceof SessionError) log.error(errText(error));
+  else log.error('خطای راه‌اندازی:', errText(error));
   process.exit(1);
 });

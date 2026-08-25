@@ -1,135 +1,161 @@
 import { humanBytes, humanDuration, progressBar, esc, truncate } from '../utils/format.js';
 
-export const LINE = '━━━━━━━━━━━━━━━━━━';
-const BRAND = '⚡️ <b>Elegram</b>';
+export const LINE = '\u2501'.repeat(18);
+const BRAND = '\u26A1\uFE0F <b>Elegram</b>';
 
-export const helpCard = () => [
+/** Anchors are built here so a URL is escaped exactly once, in one place. */
+export const link = (href, label) => `<a href="${esc(href)}">${esc(label)}</a>`;
+
+/** Keeps deliberate blank separator lines, drops only nullish entries. */
+const block = (lines) => lines.filter((line) => line != null).join('\n');
+/** Drops anything falsy — for cards whose rows are conditional. */
+const compact = (lines) => lines.filter(Boolean).join('\n');
+
+export const helpCard = () => block([
   `${BRAND} — دستیار آرشیو تلگرام`,
   LINE,
-  '<b>🎮 دستورات</b>',
-  '▪️ <code>/ping</code> — بررسی اتصال و آپ‌تایم',
-  '▪️ <code>/save</code> — آرشیو پیام ریپلای‌شده (حتی ضدفوروارد)',
-  '▪️ <code>/auto on</code> | <code>/auto off</code> — سیو خودکار همین چت',
-  '▪️ <code>/autolist</code> — چت‌های دارای سیو خودکار',
-  '▪️ <code>/status</code> — آمار و وضعیت سیستم',
-  '▪️ <code>/help</code> — راهنما',
+  '<b>\u{1F3AE} دستورات</b>',
+  '\u25AA\uFE0F <code>/save</code> — روی رسانه ریپلای کن و بفرست (حتی ضدفوروارد)',
+  '\u25AA\uFE0F <code>/auto on</code> | <code>/auto off</code> — سیو خودکار همین چت',
+  '\u25AA\uFE0F <code>/autolist</code> — چت‌های دارای سیو خودکار',
+  '\u25AA\uFE0F <code>/status</code> — آمار و وضعیت سیستم',
+  '\u25AA\uFE0F <code>/cancel</code> — پاک کردن صف انتظار',
+  '\u25AA\uFE0F <code>/ping</code> — بررسی اتصال و آپ‌تایم',
+  '\u25AA\uFE0F <code>/help</code> — همین راهنما',
   LINE,
-  '<b>🎯 قابلیت‌های همیشگی</b>',
-  '▫️ شکار لحظه‌ای رسانه‌های محوشونده (TTL)',
-  '▫️ عبور از قفل فوروارد با دانلود و بازآپلود',
-  '▫️ آلبوم، استیکر، وویس، ویدیو و همه فرمت‌ها بدون افت کیفیت',
+  '<b>\u{1F3AF} قابلیت‌های همیشگی</b>',
+  '\u25AB\uFE0F شکار لحظه‌ای رسانه‌های محوشونده (TTL)',
+  '\u25AB\uFE0F عبور از قفل فوروارد با دانلود و بازآپلود',
+  '\u25AB\uFE0F آلبوم، استیکر، وویس، ویدیو و همه فرمت‌ها بدون افت کیفیت',
   LINE,
-  '💡 <i>روی رسانه ریپلای کن و /save بزن</i>',
-].join('\n');
+  '\u{1F4A1} <i>رسانه‌های یک‌بارمصرف بدون هیچ دستوری سیو می‌شوند.</i>',
+]);
 
-export const pingCard = ({ latency, uptime }) => [
-  '🏓 <b>Pong!</b>',
+export const pingCard = ({ latency, uptime }) => block([
+  '\u{1F3D3} <b>Pong!</b>',
   LINE,
-  `⚡️ تأخیر: <code>${latency}ms</code>`,
-  `⏱ آپ‌تایم: <code>${humanDuration(uptime)}</code>`,
-  '📡 وضعیت: <b>متصل و آماده</b>',
-].join('\n');
+  `\u26A1\uFE0F تأخیر: <code>${Number(latency) || 0}ms</code>`,
+  `\u23F1 آپ‌تایم: <code>${humanDuration(uptime)}</code>`,
+  '\u{1F4E1} وضعیت: <b>متصل و آماده</b>',
+]);
 
-export const statusCard = (s) => [
-  '📊 <b>وضعیت سیستم</b>',
+export const statusCard = (s) => block([
+  '\u{1F4CA} <b>وضعیت سیستم</b>',
   LINE,
-  '<b>🖥 سیستم</b>',
-  `▫️ آپ‌تایم: <code>${humanDuration(s.uptime)}</code>`,
-  `▫️ رم مصرفی: <code>${humanBytes(s.rss)}</code>`,
-  `▫️ نسخه Node: <code>${esc(s.node)}</code>`,
+  '<b>\u{1F5A5} سیستم</b>',
+  `\u25AB\uFE0F آپ‌تایم: <code>${humanDuration(s.uptime)}</code>`,
+  `\u25AB\uFE0F رم مصرفی: <code>${humanBytes(s.rss)}</code>`,
+  `\u25AB\uFE0F نسخه: <code>Elegram ${esc(s.version)} \u2022 Node ${esc(s.node)}</code>`,
   '',
-  '<b>🗄 آرشیو</b>',
-  `▫️ مقصد: <code>${esc(s.dest)}</code>`,
-  `▫️ فایل‌های ذخیره‌شده: <b>${s.archived}</b>`,
-  `▫️ حجم کل: <b>${humanBytes(s.bytes)}</b>`,
-  `▫️ صف: <b>${s.pending}</b> در انتظار • <b>${s.running}</b> در حال پردازش`,
+  '<b>\u{1F5C4} آرشیو</b>',
+  `\u25AB\uFE0F مقصد: <code>${esc(s.dest)}</code>`,
+  `\u25AB\uFE0F فایل‌های ذخیره‌شده: <b>${s.archived}</b>`,
+  `\u25AB\uFE0F حجم کل: <b>${humanBytes(s.bytes)}</b>`,
+  s.failed ? `\u25AB\uFE0F ناموفق: <b>${s.failed}</b>` : null,
+  `\u25AB\uFE0F صف: <b>${s.pending}</b> در انتظار \u2022 <b>${s.running}</b> در حال پردازش`,
   '',
-  '<b>🔁 سیو خودکار</b>',
-  `▫️ چت‌های فعال: <b>${s.autos}</b>`,
-].join('\n');
+  '<b>\u{1F501} سیو خودکار</b>',
+  `\u25AB\uFE0F چت‌های فعال: <b>${s.autos}</b>`,
+]);
 
-export const autoOn = (title) => [
-  '🔔 <b>سیو خودکار فعال شد</b>',
+export const autoOn = (title) => block([
+  '\u{1F514} <b>سیو خودکار فعال شد</b>',
   LINE,
-  `💬 چت: <b>${esc(title)}</b>`,
-  '▫️ از این پس تمام رسانه‌های این چت به‌صورت خودکار آرشیو می‌شوند.',
-].join('\n');
+  `\u{1F4AC} چت: <b>${esc(title)}</b>`,
+  '\u25AB\uFE0F از این پس تمام رسانه‌های این چت به‌صورت خودکار آرشیو می‌شوند.',
+]);
 
-export const autoOff = (title) => [
-  '🔕 <b>سیو خودکار غیرفعال شد</b>',
+export const autoOff = (title) => block([
+  '\u{1F515} <b>سیو خودکار غیرفعال شد</b>',
   LINE,
-  `💬 چت: <b>${esc(title)}</b>`,
-].join('\n');
+  `\u{1F4AC} چت: <b>${esc(title)}</b>`,
+]);
 
-export const autoUsage = () =>
-  ['⚠️ استفاده صحیح:', '', '<code>/auto on</code> یا <code>/auto off</code>'].join('\n');
-
-export const savedGuard = () => [
-  'ℹ️ اینجا <b>Saved Messages</b> خودت است!',
+export const autoAlready = (title, on) => block([
+  on ? '\u2139\uFE0F سیو خودکار این چت از قبل روشن بود.' : '\u2139\uFE0F سیو خودکار این چت از قبل خاموش بود.',
   '',
-  'برای فعال‌سازی سیو خودکار، داخل چت موردنظر دستور <code>/auto on</code> را بفرست.',
-].join('\n');
+  `\u{1F4AC} چت: <b>${esc(title)}</b>`,
+]);
 
-export const autoList = (map) => {
-  const entries = Object.entries(map || {});
-  if (!entries.length) {
-    return [
-      '📭 هیچ چتی دارای سیو خودکار نیست.',
+export const autoUsage = () => compact([
+  '\u26A0\uFE0F استفاده صحیح:',
+  '',
+  '<code>/auto on</code> یا <code>/auto off</code>',
+]);
+
+export const savedGuard = () => compact([
+  '\u2139\uFE0F اینجا <b>Saved Messages</b> خودت است!',
+  '',
+  'برای فعال‌سازی سیو خودکار، داخل چت موردنطر دستور <code>/auto on</code> را بفرست.',
+]);
+
+export const autoList = (entries) => {
+  const list = Array.isArray(entries) ? entries : Object.entries(entries ?? {});
+  if (!list.length) {
+    return compact([
+      '\u{1F4ED} هیچ چتی دارای سیو خودکار نیست.',
       '',
-      '💡 داخل چت موردنظر دستور <code>/auto on</code> را بفرست.',
-    ].join('\n');
+      '\u{1F4A1} داخل چت موردنطر دستور <code>/auto on</code> را بفرست.',
+    ]);
   }
-  const rows = entries
+  const rows = list
     .map(([key, value], index) => {
       const since = Number(value?.since) || Date.now();
-      return `${index + 1}. <b>${esc(value?.title || key)}</b>\n    └ از ${humanDuration(Date.now() - since)} پیش`;
+      return `${index + 1}. <b>${esc(value?.title || key)}</b>\n    \u2514 از ${humanDuration(Date.now() - since)} پیش`;
     })
     .join('\n');
-  return [`🔁 <b>چت‌های دارای سیو خودکار (${entries.length})</b>`, LINE, rows].join('\n');
+  return block([`\u{1F501} <b>چت‌های دارای سیو خودکار (${list.length})</b>`, LINE, rows]);
 };
 
-export const notReply = () => [
-  '🤔 پیامی برای ذخیره پیدا نکردم.',
+export const notReply = () => compact([
+  '\u{1F914} پیامی برای ذخیره پیدا نکردم.',
   '',
-  'روی پیام یا رسانه موردنظر <b>ریپلای</b> کن و بعد <code>/save</code> بفرست.',
-].join('\n');
+  'روی پیام یا رسانه موردنطر <b>ریپلای</b> کن و بعد <code>/save</code> بفرست.',
+]);
 
-export const noMedia = () => '🚫 در این پیام رسانه‌ای برای آرشیو وجود ندارد.';
+export const noMedia = () => '\u{1F6AB} در این پیام رسانه‌ای برای آرشیو وجود ندارد.';
 
-export const queuedCard = ({ kind, size, pos, urgent }) => [
-  '📥 <b>در صف آرشیو…</b>',
+export const queuedCard = ({ kind, size, pos, urgent }) => compact([
+  '\u{1F4E5} <b>در صف آرشیو…</b>',
   LINE,
-  `🗂 نوع: <b>${esc(kind)}</b>`,
-  size && size !== '0 B' ? `💾 حجم: <b>${esc(size)}</b>` : '',
-  `📍 جایگاه در صف: <b>${pos}</b>`,
-  urgent ? '\n⚡️ <b>اولویت حداکثری — رسانه محوشونده!</b>' : '',
-].filter(Boolean).join('\n');
+  `\u{1F5C2} نوع: <b>${esc(kind)}</b>`,
+  size && size !== '0 B' ? `\u{1F4BE} حجم: <b>${esc(size)}</b>` : '',
+  `\u{1F4CD} جایگاه در صف: <b>${pos}</b>`,
+  urgent ? '\n\u26A1\uFE0F <b>اولویت حداکزری — رسانه محوشونده!</b>' : '',
+]);
 
 export const progressCard = ({ stage, pct, kind, size, urgent }) => {
   const label = stage === 'download'
-    ? '⬇️ <b>در حال دانلود از منبع…</b>'
-    : '⬆️ <b>در حال آپلود به آرشیو…</b>';
-  return [
-    '📦 <b>در حال آرشیو</b>',
+    ? '\u2B07\uFE0F <b>در حال دانلود از منبع…</b>'
+    : '\u2B06\uFE0F <b>در حال آپلود به آرشیو…</b>';
+  return compact([
+    '\u{1F4E6} <b>در حال آرشیو</b>',
     LINE,
     label,
     `<code>[${progressBar(pct)}] ${pct}%</code>`,
-    `🗂 ${esc(kind)}${size && size !== '0 B' ? ` • 💾 ${esc(size)}` : ''}`,
-    urgent ? '⏳ رسانه محوشونده — با سرعت کامل!' : '',
-  ].filter(Boolean).join('\n');
+    `\u{1F5C2} ${esc(kind)}${size && size !== '0 B' ? ` \u2022 \u{1F4BE} ${esc(size)}` : ''}`,
+    urgent ? '\u23F3 رسانه محوشونده — با سرعت کامل!' : '',
+  ]);
 };
 
-export const albumCard = (count, kind, size) => [
-  '🗃 <b>در حال آرشیو آلبوم</b>',
+export const albumCard = (count, kind, size) => compact([
+  '\u{1F5C3} <b>در حال آرشیو آلبوم</b>',
   LINE,
-  `▫️ تعداد: <b>${count}</b> مورد`,
-  `▫️ حجم کل: <b>${esc(size)}</b>`,
-  kind ? `▫️ محتوا: <b>${esc(kind)}</b>` : '',
-].filter(Boolean).join('\n');
+  `\u25AB\uFE0F تعداد: <b>${count}</b> مورد`,
+  `\u25AB\uFE0F حجم کل: <b>${esc(size)}</b>`,
+  kind ? `\u25AB\uFE0F محتوا: <b>${esc(kind)}</b>` : '',
+]);
 
-// Escape *after* truncating, otherwise a cut can slice an HTML entity in half.
-export const errorCard = (message) => [
-  '❌ <b>آرشیو ناموفق بود</b>',
+export const cancelCard = (dropped) => block([
+  dropped ? '\u{1F9F9} <b>صف پاک شد</b>' : '\u2139\uFE0F صف خالی بود.',
+  LINE,
+  `\u25AB\uFE0F کارهای حذف‌شده: <b>${dropped}</b>`,
+  '\u25AB\uFE0F کارهای در حال اجرا متوقف نمی‌شوند.',
+]);
+
+// Truncate raw text first, escape second — a blind cut can slice an entity.
+export const errorCard = (message) => block([
+  '\u274C <b>آرشیو ناموفق بود</b>',
   LINE,
   `<code>${esc(truncate(message || 'خطای ناشناخته', 300))}</code>`,
-].join('\n');
+]);

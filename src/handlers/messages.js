@@ -1,25 +1,28 @@
-import path from 'node:path';
+// Documented subpath — see the note in services/client.js about why
+// `teleproto/events/index.js` cannot work.
 import { NewMessage } from 'teleproto/events';
-import { config } from '../config.js';
 import { Archiver } from '../services/archiver.js';
 import { TaskQueue } from '../services/queue.js';
 import { AlbumBuffer } from '../services/albums.js';
-import { isSelfDestruct, isExpiring } from '../services/mediaInfo.js';
+import { idStr, isExpiring, isSelfDestruct } from '../services/mediaInfo.js';
+import { LruSet } from '../utils/lru.js';
 import { createCommandHandler } from './commands.js';
 import { log, errText } from '../utils/logger.js';
 
-const SEEN_LIMIT = 2000;
+// Commands are ordinary outgoing messages, so let the builder filter them out
+// before we ever see them instead of re-checking `out` by hand.
+const COMMAND_PATTERN = /^\s*\/[a-zA-Z]/;
 
-// Commands are ordinary outgoing messages, so the builder can filter them
-// before we ever see them instead of us re-checking `out` by hand.
-const COMMAND_PATTERN = /^\s*\/[a-z]/i;
-
-export function registerHandlers(ctx) {
+export function registerHandlers(ctx, config) {
   const { client, store, me } = ctx;
+  const myId = idStr(me?.id);
 
   const archiver = new Archiver(client, store, {
-    tmpDir: path.join(config.dataDir, 'tmp'),
+    tmpDir: config.tmpDir,
     dest: config.storagePeer,
+    timezone: config.timezone,
+    uploadWorkers: config.uploadWorkers,
+    doneReaction: config.doneReaction,
   });
   const queue = new TaskQueue((job) => archiver.runJob(job), config.concurrency);
   ctx.archiver = archiver;
@@ -27,18 +30,14 @@ export function registerHandlers(ctx) {
 
   const onCommand = createCommandHandler(ctx);
 
-  // Telegram can replay an update; without this a media file gets archived twice.
-  const seen = new Set();
-  const alreadyHandled = (msg) => {
-    const key = `${msg.chatId ?? '?'}|${msg.id}`;
-    if (seen.has(key)) return true;
-    seen.add(key);
-    if (seen.size > SEEN_LIMIT) seen.delete(seen.values().next().value);
-    return false;
-  };
+  // Telegram happily replays an update after a reconnect; without this a file
+  // gets archived twice.
+  const seen = new LruSet(2048);
 
-  // Fire-and-forget jobs must swallow their rejection, otherwise a failed
-  // archive becomes an unhandled rejection and takes the process down.
+  /**
+   * Fire-and-forget jobs must swallow their own rejection: an unhandled
+   * rejection from a failed archive would otherwise take the whole process out.
+   */
   const enqueue = (messages, priority = false) => {
     queue.add({ messages }, { priority }).catch((error) => {
       log.error('آرشیو خودکار ناموفق:', errText(error));
@@ -54,25 +53,29 @@ export function registerHandlers(ctx) {
   });
 
   const onIncoming = (msg) => {
-    if (!msg?.media || alreadyHandled(msg)) return;
-    const chatKey = msg.chatId != null ? String(msg.chatId) : '';
+    if (!msg?.media) return;
+    const chatKey = idStr(msg.chatId);
+    if (seen.add(`${chatKey || '?'}|${msg.id}`)) return;
     // Saved Messages is the archive destination, never a source.
-    if (me?.id != null && chatKey === String(me.id)) return;
+    if (myId && chatKey === myId) return;
+
+    // TTL media is archived unconditionally and jumps the queue: the whole
+    // point of this project is winning the race against the self-destruct timer.
     if (isSelfDestruct(msg)) {
       enqueue([msg], true);
       return;
     }
     if (!store.isAuto(chatKey)) return;
     if (msg.groupedId != null) {
-      albums.push(`${chatKey}|${msg.groupedId}`, msg);
+      albums.push(`${chatKey}|${idStr(msg.groupedId)}`, msg);
       return;
     }
     enqueue([msg], isExpiring(msg));
   };
 
-  // Two builders, each with its own filter, so the library sorts commands from
-  // media for us. Callbacks guard themselves: teleproto has no chain-level
-  // error hook, and a throw inside a handler must not reach the update loop.
+  // Two builders with their own filters, so the library sorts commands from
+  // media for us. Both callbacks guard themselves: teleproto has no chain-level
+  // error hook and a throw inside a handler must not reach the update loop.
   const commandFilter = new NewMessage({ outgoing: true, pattern: COMMAND_PATTERN });
   const handleCommand = async (event) => {
     try {
@@ -93,9 +96,8 @@ export function registerHandlers(ctx) {
     }
   };
 
-  // `addEventHandler(callback, builder)` is the whole subscription model in
-  // teleproto. There is no `client.updates` chain to hang handlers off, so the
-  // previous wiring registered nothing at all and every command went unheard.
+  // `addEventHandler(callback, builder)` is the entire subscription model in
+  // teleproto — there is no `client.updates` chain to hang handlers off.
   client.addEventHandler(handleCommand, commandFilter);
   client.addEventHandler(handleMedia, mediaFilter);
 
@@ -104,8 +106,9 @@ export function registerHandlers(ctx) {
     client.removeEventHandler(handleCommand, commandFilter);
     client.removeEventHandler(handleMedia, mediaFilter);
     albums.dispose();
-    queue.clear('خاموشی سرویس');
+    queue.close('خاموشی سرویس');
   };
 
   log.ok('هندلرها فعال شدند — منتظر پیام‌ها…');
+  return { archiver, queue, albums };
 }
