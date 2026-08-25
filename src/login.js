@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import readline from 'node:readline/promises';
 import { TelegramClient } from 'teleproto';
-// Documented subpath. `teleproto/sessions/index.js` is not in the package's
-// "exports" map and Node refuses it with ERR_PACKAGE_PATH_NOT_EXPORTED.
-import { StringSession } from 'teleproto/sessions';
+// No "exports" map in teleproto, so this subpath is a directory on disk and ESM
+// refuses directory imports (ERR_UNSUPPORTED_DIR_IMPORT). Import the file.
+import { StringSession } from 'teleproto/sessions/index.js';
 import { config, configIssues } from './config.js';
 import { log, errText, setLogLevel } from './utils/logger.js';
 

@@ -1,6 +1,7 @@
-// Documented subpath — see the note in services/client.js about why
-// `teleproto/events/index.js` cannot work.
-import { NewMessage } from 'teleproto/events';
+// teleproto declares no "exports" map, so Node resolves this subpath as a real
+// directory — and ESM refuses directory imports (ERR_UNSUPPORTED_DIR_IMPORT).
+// The explicit `/index.js` is the form that actually resolves.
+import { NewMessage } from 'teleproto/events/index.js';
 import { Archiver } from '../services/archiver.js';
 import { TaskQueue } from '../services/queue.js';
 import { AlbumBuffer } from '../services/albums.js';
