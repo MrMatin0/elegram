@@ -86,7 +86,7 @@ export const autoUsage = () => compact([
 export const savedGuard = () => compact([
   '\u2139\uFE0F اینجا <b>Saved Messages</b> خودت است!',
   '',
-  'برای فعال‌سازی سیو خودکار، داخل چت موردنطر دستور <code>/auto on</code> را بفرست.',
+  'برای فعال‌سازی سیو خودکار، داخل چت موردنظر دستور <code>/auto on</code> را بفرست.',
 ]);
 
 export const autoList = (entries) => {
@@ -95,7 +95,7 @@ export const autoList = (entries) => {
     return compact([
       '\u{1F4ED} هیچ چتی دارای سیو خودکار نیست.',
       '',
-      '\u{1F4A1} داخل چت موردنطر دستور <code>/auto on</code> را بفرست.',
+      '\u{1F4A1} داخل چت موردنظر دستور <code>/auto on</code> را بفرست.',
     ]);
   }
   const rows = list
@@ -110,7 +110,7 @@ export const autoList = (entries) => {
 export const notReply = () => compact([
   '\u{1F914} پیامی برای ذخیره پیدا نکردم.',
   '',
-  'روی پیام یا رسانه موردنطر <b>ریپلای</b> کن و بعد <code>/save</code> بفرست.',
+  'روی پیام یا رسانه موردنظر <b>ریپلای</b> کن و بعد <code>/save</code> بفرست.',
 ]);
 
 export const noMedia = () => '\u{1F6AB} در این پیام رسانه‌ای برای آرشیو وجود ندارد.';
@@ -121,7 +121,7 @@ export const queuedCard = ({ kind, size, pos, urgent }) => compact([
   `\u{1F5C2} نوع: <b>${esc(kind)}</b>`,
   size && size !== '0 B' ? `\u{1F4BE} حجم: <b>${esc(size)}</b>` : '',
   `\u{1F4CD} جایگاه در صف: <b>${pos}</b>`,
-  urgent ? '\n\u26A1\uFE0F <b>اولویت حداکزری — رسانه محوشونده!</b>' : '',
+  urgent ? '\n\u26A1\uFE0F <b>اولویت حداکثری — رسانه محوشونده!</b>' : '',
 ]);
 
 export const progressCard = ({ stage, pct, kind, size, urgent }) => {

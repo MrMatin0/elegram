@@ -17,7 +17,7 @@ const raw = (key) => {
 function text(key, { required = false, fallback = '' } = {}) {
   const value = raw(key);
   if (!value) {
-    if (required) problems.push(`متغیر محیطی ${key} تنطیم نشده است.`);
+    if (required) problems.push(`متغیر محیطی ${key} تنظیم نشده است.`);
     return fallback;
   }
   return value;
@@ -26,7 +26,7 @@ function text(key, { required = false, fallback = '' } = {}) {
 function integer(key, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER, required = false } = {}) {
   const value = raw(key);
   if (!value) {
-    if (required) problems.push(`متغیر محیطی ${key} تنطیم نشده است.`);
+    if (required) problems.push(`متغیر محیطی ${key} تنظیم نشده است.`);
     return fallback;
   }
   const parsed = Number(value);
