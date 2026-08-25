@@ -1,77 +1,109 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import * as cards from '../ui/cards.js';
-import { humanBytes, esc, faDate, joinWithin } from '../utils/format.js';
+import { humanBytes, esc, faDate, joinWithin, percent } from '../utils/format.js';
+import { LruMap } from '../utils/lru.js';
+import { withRetry, isNotModified } from '../utils/retry.js';
+import { log, errText } from '../utils/logger.js';
 import {
+  buildMessageLink,
+  displayName,
+  guessFilename,
+  idStr,
   isSelfDestruct,
   mediaKind,
-  guessFilename,
-  rebuildAttributes,
+  mediaSize,
   shouldForceDocument,
-  buildLink,
-  displayName,
 } from './mediaInfo.js';
-import { withRetry } from '../utils/retry.js';
-import { log, errText } from '../utils/logger.js';
+import { rebuildAttributes } from './attributes.js';
 
 const CAPTION_LIMIT = 1024;
 const TITLE_CACHE_LIMIT = 500;
-const PROGRESS_MIN_STEP = 10;
-const PROGRESS_MIN_INTERVAL = 2000;
-const DONE_REACTION = '⚡️';
+// Telegram rate-limits edits hard, and editing to identical text is a 400.
+const PROGRESS_MIN_INTERVAL_MS = 2500;
+const PROGRESS_MIN_STEP = 7;
 
 const peerOf = (msg) => msg?.peerId ?? msg?.chatId;
 
+let jobCounter = 0;
+const nextJobId = () => {
+  jobCounter = (jobCounter + 1) % 1_000_000;
+  return `${Date.now().toString(36)}-${jobCounter.toString(36)}`;
+};
+
+/**
+ * The archive engine.
+ *
+ * Two strategies, picked per message:
+ *   direct   — hand Telegram the existing media reference. Instant, no bytes
+ *              cross the wire, keeps original quality. Fails for protected
+ *              (`noforwards`) chats, and is *never* used for TTL media because
+ *              the archived copy would inherit the self-destruct timer.
+ *   reupload — download to a temp file, then upload a fresh copy. Slower, but
+ *              it is the only way past a forward lock or a TTL timer.
+ */
 export class Archiver {
-  constructor(client, store, { tmpDir, dest } = {}) {
+  constructor(client, store, { tmpDir, dest = 'me', timezone, uploadWorkers = 4, doneReaction = '' } = {}) {
     this.client = client;
     this.store = store;
     this.tmpDir = tmpDir;
     this.dest = dest || 'me';
-    this.titles = new Map();
-    this._destPeer = null;
+    this.timezone = timezone;
+    this.uploadWorkers = Math.max(1, Number(uploadWorkers) || 1);
+    this.doneReaction = doneReaction;
+    this.titles = new LruMap(TITLE_CACHE_LIMIT);
+    this._destPromise = null;
   }
 
-  /** Resolves the archive destination once and falls back to Saved Messages. */
-  async resolveDest() {
-    if (this._destPeer) return this._destPeer;
-    try {
-      this._destPeer = await this.client.getInputEntity(this.dest);
-    } catch (error) {
-      if (this.dest !== 'me') {
-        log.warn(`مقصد آرشیو «${this.dest}» در دسترس نیست؛ Saved Messages استفاده می‌شود.`, errText(error));
-      }
-      this._destPeer = await this.client.getInputEntity('me');
-      this.dest = 'me';
+  // ---------------------------------------------------------------- destination
+
+  /**
+   * Resolves the archive destination exactly once. Memoizing the *promise*
+   * (not the value) is what stops N concurrent jobs from firing N identical
+   * `getInputEntity` calls straight into a flood wait on startup.
+   */
+  destPeer() {
+    if (!this._destPromise) {
+      this._destPromise = this._resolveDest().catch((error) => {
+        this._destPromise = null;
+        throw error;
+      });
     }
-    return this._destPeer;
+    return this._destPromise;
+  }
+
+  async _resolveDest() {
+    if (this.dest && this.dest !== 'me') {
+      try {
+        const peer = await this.client.getInputEntity(this.dest);
+        log.ok(`مقصد آرشیو: ${this.dest}`);
+        return peer;
+      } catch (error) {
+        log.warn(`مقصد آرشیو «${this.dest}» در دسترس نیست؛ Saved Messages استفاده می‌شود.`, errText(error));
+        this.dest = 'me';
+      }
+    }
+    return this.client.getInputEntity('me');
   }
 
   sendFile(options, label = 'sendFile') {
-    return withRetry(async () => this.client.sendFile(await this.resolveDest(), options), { label });
+    return withRetry(async () => this.client.sendFile(await this.destPeer(), options), { label });
   }
 
   sendText(message) {
     return withRetry(
-      async () => this.client.sendMessage(await this.resolveDest(), { message, parseMode: 'html', linkPreview: false }),
+      async () => this.client.sendMessage(await this.destPeer(), { message, parseMode: 'html', linkPreview: false }),
       { label: 'sendMessage' },
     );
   }
 
-  cacheTitle(key, title) {
-    if (!key || !title) return;
-    if (this.titles.size >= TITLE_CACHE_LIMIT) {
-      const oldest = this.titles.keys().next().value;
-      this.titles.delete(oldest);
-    }
-    this.titles.set(key, title);
-  }
+  // ------------------------------------------------------------------ metadata
 
   async chatTitle(msg, chatId) {
     if (!chatId) return '';
     const cached = this.titles.get(chatId);
-    if (cached) return cached;
-    let title = msg.chat ? displayName(msg.chat) : '';
+    if (cached != null) return cached;
+    let title = msg?.chat ? displayName(msg.chat) : '';
     if (!title) {
       try {
         title = displayName(await this.client.getEntity(chatId));
@@ -79,23 +111,24 @@ export class Archiver {
         title = '';
       }
     }
-    this.cacheTitle(chatId, title);
+    this.titles.set(chatId, title);
     return title;
   }
 
   async describe(msg) {
-    const chatId = msg?.chatId != null ? String(msg.chatId) : '';
-    const senderId = msg?.senderId != null ? String(msg.senderId) : '';
+    const chatId = idStr(msg?.chatId);
+    const senderId = idStr(msg?.senderId);
     const seconds = Number(msg?.date) || Math.floor(Date.now() / 1000);
     const info = {
-      kind: mediaKind(msg) || 'رسانه 📎',
-      size: Number(msg?.file?.size || 0),
+      kind: mediaKind(msg) ?? 'رسانه \u{1F4CE}',
+      size: mediaSize(msg),
       ttl: isSelfDestruct(msg),
       chatTitle: await this.chatTitle(msg, chatId),
       senderName: '',
-      date: faDate(new Date(seconds * 1000)),
-      link: buildLink(msg),
+      date: faDate(new Date(seconds * 1000), this.timezone),
+      link: buildMessageLink(msg),
     };
+
     if (senderId && senderId === chatId) {
       info.senderName = info.chatTitle;
     } else if (senderId) {
@@ -113,32 +146,39 @@ export class Archiver {
   }
 
   caption(info) {
-    const lines = ['📥 <b>آرشیو شد</b>', cards.LINE, `🗂 نوع: <b>${esc(info.kind)}</b>`];
-    if (info.size) lines.push(`💾 حجم: <b>${humanBytes(info.size)}</b>`);
-    if (info.chatTitle) lines.push(`💬 منبع: <b>${esc(info.chatTitle)}</b>`);
+    const lines = ['\u{1F4E5} <b>آرشیو شد</b>', cards.LINE, `\u{1F5C2} نوع: <b>${esc(info.kind)}</b>`];
+    if (info.size) lines.push(`\u{1F4BE} حجم: <b>${humanBytes(info.size)}</b>`);
+    if (info.chatTitle) lines.push(`\u{1F4AC} منبع: <b>${esc(info.chatTitle)}</b>`);
     if (info.senderName && info.senderName !== info.chatTitle) {
-      lines.push(`👤 فرستنده: <b>${esc(info.senderName)}</b>`);
+      lines.push(`\u{1F464} فرستنده: <b>${esc(info.senderName)}</b>`);
     }
-    if (info.date) lines.push(`🗓 زمان اصلی: <i>${esc(info.date)}</i>`);
-    if (info.link) lines.push(info.link);
-    if (info.ttl) lines.push('', '⏳ <b>رسانه محوشونده — بلافاصله ذخیره شد</b>');
+    if (info.date) lines.push(`\u{1F5D3} زمان اصلی: <i>${esc(info.date)}</i>`);
+    if (info.link) lines.push(cards.link(info.link, '\u{1F517} مشاهده پیام اصلی'));
+    if (info.ttl) lines.push('', '\u23F3 <b>رسانه محوشونده — بلافاصله ذخیره شد</b>');
     return joinWithin(lines, CAPTION_LIMIT);
   }
 
   albumCaption(count, info) {
-    const lines = [`🗃 <b>آلبوم攏 ${count} رسانه‌ای ذخیره شد</b>`, cards.LINE];
-    if (info.chatTitle) lines.push(`💬 منبع: <b>${esc(info.chatTitle)}</b>`);
+    const lines = [`\u{1F5C3} <b>آلبوم ${count} رسانه‌ای ذخیره شد</b>`, cards.LINE];
+    if (info.chatTitle) lines.push(`\u{1F4AC} منبع: <b>${esc(info.chatTitle)}</b>`);
     if (info.senderName && info.senderName !== info.chatTitle) {
-      lines.push(`👤 فرستنده: <b>${esc(info.senderName)}</b>`);
+      lines.push(`\u{1F464} فرستنده: <b>${esc(info.senderName)}</b>`);
     }
-    if (info.date) lines.push(`🗓 زمان اصلی: <i>${esc(info.date)}</i>`);
-    if (info.link) lines.push(info.link);
+    if (info.date) lines.push(`\u{1F5D3} زمان اصلی: <i>${esc(info.date)}</i>`);
+    if (info.link) lines.push(cards.link(info.link, '\u{1F517} مشاهده پیام اصلی'));
     return joinWithin(lines, CAPTION_LIMIT);
   }
 
-  /** teleproto takes the new text as `message`, with the id in the same object. */
+  // -------------------------------------------------------------- status message
+
+  /**
+   * teleproto signature is `editMessage(entity, { message, id })` where
+   * `message` is the NEW TEXT and `id` is the target message id. v1 passed the
+   * id as `message` and the text as `text`, so every single status edit was
+   * rejected by the server — which is why the commands looked dead.
+   */
   async safeEdit(message, text) {
-    if (!message) return;
+    if (!message?.id || !text) return false;
     try {
       await this.client.editMessage(peerOf(message), {
         message: text,
@@ -146,43 +186,50 @@ export class Archiver {
         parseMode: 'html',
         linkPreview: false,
       });
-    } catch {
-      /* the status message may already be gone */
+      return true;
+    } catch (error) {
+      if (!isNotModified(error)) {
+        log.debug('[archiver] ویرایش پیام وضعیت ناموفق بود:', errText(error));
+      }
+      return false;
     }
   }
 
   hide(message) {
-    message?.delete?.().catch(() => {});
+    if (!message?.delete) return;
+    Promise.resolve(message.delete({ revoke: true })).catch(() => {});
   }
 
-  /** Cosmetic "done" mark on the source message. */
+  /** Cosmetic "done" mark on the source message; failure is never interesting. */
   async react(msg) {
-    if (!msg?.id) return;
+    if (!this.doneReaction || !msg?.id) return;
     try {
-      await this.client.sendReaction(peerOf(msg), msg.id, DONE_REACTION);
-    } catch {
-      /* reactions are cosmetic */
+      await this.client.sendReaction(peerOf(msg), msg.id, this.doneReaction);
+    } catch (error) {
+      log.debug('[archiver] ری‌اکشن ثبت نشد:', errText(error));
     }
   }
 
   /**
-   * One throttled reporter per job — the old code rebuilt it per file, which
-   * reset the throttle and spammed Telegram with edits.
+   * One throttled progress reporter per job. v1 built one per *file*, which
+   * reset the throttle on every item of an album and spammed Telegram.
    */
   createProgress(statusMsg, info) {
     let stopped = false;
     let lastStage = '';
     let lastPct = -1;
     let lastAt = 0;
+
     const report = (stage, received, total) => {
       if (stopped || !statusMsg) return;
-      const totalNum = Number(total) || 0;
-      const pct = totalNum > 0
-        ? Math.max(0, Math.min(100, Math.floor((Number(received) / totalNum) * 100)))
-        : 0;
+      const pct = percent(received, total);
       const now = Date.now();
-      const sameStage = stage === lastStage;
-      if (sameStage && pct - lastPct < PROGRESS_MIN_STEP && now - lastAt < PROGRESS_MIN_INTERVAL) return;
+      const stageChanged = stage !== lastStage;
+      // Require BOTH a real jump and a cooled-down timer. v1's condition let an
+      // edit through every 2s even at an unchanged percentage, which meant a
+      // steady stream of MESSAGE_NOT_MODIFIED errors on slow transfers.
+      const worthEditing = stageChanged || (pct !== lastPct && now - lastAt >= PROGRESS_MIN_INTERVAL_MS && (pct - lastPct >= PROGRESS_MIN_STEP || pct === 100));
+      if (!worthEditing) return;
       lastStage = stage;
       lastPct = pct;
       lastAt = now;
@@ -200,28 +247,37 @@ export class Archiver {
     return report;
   }
 
+  // ----------------------------------------------------------------------- jobs
+
   async runJob(job) {
-    const { statusMsg, explicit } = job;
-    const messages = (job.messages || []).filter((msg) => msg && msg.media);
-    if (!messages.length) return { bytes: 0, count: 0 };
+    const { statusMsg, explicit } = job ?? {};
+    const messages = (job?.messages ?? []).filter((msg) => msg?.media);
+    if (!messages.length) return { bytes: 0, count: 0, method: 'skipped' };
+
+    const workDir = path.join(this.tmpDir, nextJobId());
     try {
       const result = messages.length === 1
-        ? await this.archiveOne(messages[0], statusMsg)
-        : await this.archiveAlbum(messages, statusMsg);
+        ? await this.archiveOne(messages[0], statusMsg, workDir)
+        : await this.archiveAlbum(messages, statusMsg, workDir);
       this.store.countArchive(result.bytes, result.count);
       this.hide(statusMsg);
       if (explicit) await this.react(messages[0]);
-      log.ok(`آرشیو شد: ${result.count} مورد • ${humanBytes(result.bytes)} • روش ${result.method}`);
+      log.ok(`آرشیو شد: ${result.count} مورد \u2022 ${humanBytes(result.bytes)} \u2022 روش ${result.method}`);
       return result;
     } catch (error) {
+      this.store.countFailure();
       const text = errText(error);
       log.error('آرشیو ناموفق:', text);
       await this.safeEdit(statusMsg, cards.errorCard(text));
       throw error;
+    } finally {
+      // One temp dir per job means a crashed job can never orphan bytes and two
+      // messages with the same id from different chats cannot collide.
+      await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
     }
   }
 
-  async archiveOne(msg, statusMsg) {
+  async archiveOne(msg, statusMsg, workDir) {
     const info = await this.describe(msg);
     const progress = this.createProgress(statusMsg, info);
     try {
@@ -232,85 +288,88 @@ export class Archiver {
         size: humanBytes(info.size),
         urgent: info.ttl,
       }));
-      return await this.archiveMessage(msg, this.caption(info), progress, info);
+      return await this.archiveMessage(msg, this.caption(info), progress, info, workDir);
     } finally {
       progress.stop();
     }
   }
 
-  /**
-   * Fast path forwards the media reference; TTL media is always downloaded and
-   * re-uploaded, otherwise the archived copy would self-destruct as well.
-   */
-  async archiveMessage(msg, caption, progress, info) {
+  async archiveMessage(msg, caption, progress, info, workDir) {
     if (!info.ttl) {
       try {
-        await this.sendFile({ file: msg.media, caption, parseMode: 'html', workers: 2 }, 'sendFile:direct');
-        return { bytes: Number(msg.file?.size || 0), count: 1, method: 'direct' };
+        await this.sendFile(
+          { file: msg.media, caption, parseMode: 'html', workers: this.uploadWorkers },
+          'sendFile:direct',
+        );
+        return { bytes: mediaSize(msg), count: 1, method: 'direct' };
       } catch (error) {
         log.warn('ارسال مستقیم ناموفق؛ دانلود و بازآپلود…', errText(error));
       }
     }
-    return this.reupload(msg, caption, progress);
+    return this.reupload(msg, caption, progress, workDir);
   }
 
-  async reupload(msg, caption, progress) {
+  async reupload(msg, caption, progress, workDir) {
     const fileName = guessFilename(msg);
-    const tmpPath = path.join(this.tmpDir, `${msg.id ?? 0}_${Date.now().toString(36)}_${fileName}`);
-    try {
-      await fs.mkdir(this.tmpDir, { recursive: true });
-      progress?.('download', 0, Number(msg.file?.size || 0) || 1);
-      await withRetry(
-        () => this.client.downloadMedia(msg, {
-          outputFile: tmpPath,
-          progressCallback: (received, total) => progress?.('download', received, total),
-        }),
-        { label: 'downloadMedia' },
-      );
-      const stat = await fs.stat(tmpPath).catch(() => null);
-      if (!stat?.size) throw new Error('دانلود رسانه ناموفق بود (فایل خالی).');
+    const target = path.join(workDir, `${msg.id ?? 0}_${fileName}`);
+    await fs.mkdir(workDir, { recursive: true });
 
-      const attributes = rebuildAttributes(msg, fileName);
-      const options = {
-        file: tmpPath,
-        caption,
-        parseMode: 'html',
-        forceDocument: shouldForceDocument(msg),
-        workers: 2,
-        progressCallback: (received, total) => progress?.('upload', received, total),
-      };
-      if (attributes.length) options.attributes = attributes;
-      await this.sendFile(options, 'sendFile:reupload');
-      return { bytes: stat.size, count: 1, method: 'reupload' };
-    } finally {
-      await fs.rm(tmpPath, { force: true }).catch(() => {});
-    }
+    const declared = mediaSize(msg);
+    progress?.('download', 0, declared || 1);
+    await withRetry(
+      () => this.client.downloadMedia(msg, {
+        outputFile: target,
+        progressCallback: (received, total) => progress?.('download', received, total || declared),
+      }),
+      { label: 'downloadMedia' },
+    );
+
+    const stat = await fs.stat(target).catch(() => null);
+    if (!stat?.size) throw new Error('دانلود رسانه ناموفق بود (فایل خالی).');
+
+    const attributes = rebuildAttributes(msg, fileName);
+    const options = {
+      file: target,
+      caption,
+      parseMode: 'html',
+      forceDocument: shouldForceDocument(msg),
+      workers: this.uploadWorkers,
+      progressCallback: (received, total) => progress?.('upload', received, total || stat.size),
+    };
+    if (attributes.length) options.attributes = attributes;
+    if (msg?.document?.mimeType) options.mimeType = msg.document.mimeType;
+
+    await this.sendFile(options, 'sendFile:reupload');
+    return { bytes: stat.size, count: 1, method: 'reupload' };
   }
 
-  async archiveAlbum(messages, statusMsg) {
+  async archiveAlbum(messages, statusMsg, workDir) {
     const head = await this.describe(messages[0]);
-    const declared = messages.reduce((sum, msg) => sum + Number(msg.file?.size || 0), 0);
+    const declared = messages.reduce((sum, msg) => sum + mediaSize(msg), 0);
     const hasTtl = messages.some(isSelfDestruct);
-    const progress = this.createProgress(statusMsg, head);
+    const progress = this.createProgress(statusMsg, { ...head, size: declared });
+
     try {
       await this.safeEdit(statusMsg, cards.albumCard(messages.length, head.kind, humanBytes(declared)));
+
       if (!hasTtl) {
         try {
           await this.sendFile({
             file: messages.map((msg) => msg.media),
             caption: this.albumCaption(messages.length, head),
             parseMode: 'html',
-            workers: 3,
+            workers: this.uploadWorkers,
           }, 'sendFile:album');
           return { bytes: declared, count: messages.length, method: 'direct' };
         } catch (error) {
           log.warn('ارسال مستقیم آلبوم ناموفق؛ ذخیره تک‌تک…', errText(error));
         }
       }
+
       let bytes = 0;
       for (const [index, msg] of messages.entries()) {
         const info = index === 0 ? head : await this.describe(msg);
-        const item = await this.archiveMessage(msg, this.caption(info), progress, info);
+        const item = await this.archiveMessage(msg, this.caption(info), progress, info, workDir);
         bytes += item.bytes;
       }
       await this.sendText(this.albumCaption(messages.length, head));
