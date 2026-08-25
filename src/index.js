@@ -2,7 +2,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { TelegramClient } from 'teleproto';
-import { StringSession } from 'teleproto/sessions';
+// Same reason as in login.js: an explicit index.js keeps Node's ESM resolver
+// from treating this subpath as an unsupported directory import.
+import { StringSession } from 'teleproto/sessions/index.js';
 import { config, configIssues } from './config.js';
 import { Store } from './store.js';
 import { startHealthServer, stopHealthServer } from './server.js';
