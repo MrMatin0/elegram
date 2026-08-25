@@ -172,17 +172,15 @@ export class Archiver {
   // -------------------------------------------------------------- status message
 
   /**
-   * teleproto signature is `editMessage(entity, { message, id })` where
-   * `message` is the NEW TEXT and `id` is the target message id. v1 passed the
-   * id as `message` and the text as `text`, so every single status edit was
-   * rejected by the server — which is why the commands looked dead.
+   * editMessage(entity, { message, text }): the target id goes in `message`,
+   * the new body in `text`. Keep them in that order or the edit is rejected.
    */
   async safeEdit(message, text) {
     if (!message?.id || !text) return false;
     try {
       await this.client.editMessage(peerOf(message), {
-        message: text,
-        id: message.id,
+        message: message.id,
+        text,
         parseMode: 'html',
         linkPreview: false,
       });

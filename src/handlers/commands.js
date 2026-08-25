@@ -11,17 +11,15 @@ export function createCommandHandler(ctx) {
   const { client, store, queue, me, archiver, version } = ctx;
   const myId = idStr(me?.id);
 
-  /**
-   * teleproto signature: `editMessage(entity, { message, id })` — `message` is
-   * the new body, `id` is the target. Getting this backwards (as v1 did) makes
-   * the library hunt for a message id inside a string and every command dies
-   * silently.
-   */
+  // editMessage(entity, { message, text }): `message` is the *target id*, the
+  // new body goes in `text`. There is no `id` option — passing the text as
+  // `message` made the library look for a message id in a string, so every
+  // edit was rejected and every command looked dead.
   const edit = (msg, text) =>
     client
       .editMessage(msg.peerId ?? msg.chatId, {
-        message: text,
-        id: msg.id,
+        message: msg.id,
+        text,
         parseMode: 'html',
         linkPreview: false,
       })
