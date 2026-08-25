@@ -1,16 +1,22 @@
-import { Api } from 'teleproto';
+/**
+ * Media introspection.
+ *
+ * Everything here is duck-typed against teleproto's parsed TL objects and
+ * imports nothing, which keeps it unit-testable without a Telegram connection.
+ * Anything that needs to *construct* TL objects lives in `attributes.js`.
+ */
 
-export const MEDIA_LABELS = {
-  photo: 'عکس 🖼',
-  video: 'ویدیو 🎬',
-  round: 'ویدیو مسیج 📹',
-  gif: 'گیف 🎞',
-  sticker: 'استیکر 🎭',
-  voice: 'وویس 🎤',
-  audio: 'آهنگ 🎵',
-  document: 'داکیومنت 📄',
-  media: 'رسانه 📎',
-};
+export const MEDIA_LABELS = Object.freeze({
+  photo: 'عکس \u{1F5BC}',
+  video: 'ویدیو \u{1F3AC}',
+  round: 'ویدیو مسیج \u{1F4F9}',
+  gif: 'گیف \u{1F39E}',
+  sticker: 'استیکر \u{1F3AD}',
+  voice: 'وویس \u{1F3A4}',
+  audio: 'آهنگ \u{1F3B5}',
+  document: 'داکیومنت \u{1F4C4}',
+  media: 'رسانه \u{1F4CE}',
+});
 
 const TYPE_EXTENSIONS = {
   photo: '.jpg',
@@ -32,6 +38,7 @@ const MIME_EXTENSIONS = {
   'video/mp4': '.mp4',
   'video/webm': '.webm',
   'video/quicktime': '.mov',
+  'video/x-matroska': '.mkv',
   'audio/mpeg': '.mp3',
   'audio/ogg': '.ogg',
   'audio/mp4': '.m4a',
@@ -41,19 +48,22 @@ const MIME_EXTENSIONS = {
   'application/x-tgsticker': '.tgs',
 };
 
-const UNSAFE_FILENAME = /[\x00-\x1f\\/:*?"<>|]/g;
+const UNSAFE_FILENAME = /[-\u001f\\/:*?"<>|]/g;
 
-/** teleproto sometimes hands back documents without an attributes array. */
-function attributesOf(msg) {
+/** Telegram ids arrive as BigInt-like objects; never compare them with `===`. */
+export const idStr = (value) => (value == null ? '' : String(value));
+
+/** teleproto sometimes hands back a document without an attributes array. */
+export function attributesOf(msg) {
   const list = msg?.document?.attributes;
   return Array.isArray(list) ? list : [];
 }
 
 export function findAttribute(msg, className) {
-  return attributesOf(msg).find((attr) => attr?.className === className) || null;
+  return attributesOf(msg).find((attr) => attr?.className === className) ?? null;
 }
 
-/** Stable machine readable media type — never branch on the Persian labels. */
+/** Stable machine-readable media type. Never branch on the Persian labels. */
 export function mediaType(msg) {
   if (!msg?.media) return null;
   if (msg.photo) return 'photo';
@@ -74,27 +84,36 @@ export function mediaKind(msg) {
   return type ? MEDIA_LABELS[type] ?? MEDIA_LABELS.media : null;
 }
 
-/** Seconds a one-time-view media survives after opening (0 when not TTL). */
+/** Declared size in bytes, coerced out of whatever numeric shape it arrives in. */
+export function mediaSize(msg) {
+  const value = Number(msg?.file?.size ?? msg?.document?.size ?? 0);
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+/** Seconds a one-time-view media survives after being opened (0 when not TTL). */
 export function ttlSeconds(msg) {
   const media = msg?.media;
   if (!media) return 0;
   if (media.className !== 'MessageMediaPhoto' && media.className !== 'MessageMediaDocument') return 0;
-  return Number(media.ttlSeconds) || 0;
+  const value = Number(media.ttlSeconds);
+  return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
 export function isSelfDestruct(msg) {
   return ttlSeconds(msg) > 0;
 }
 
-/** True for TTL media *and* messages inside chats with an auto-delete timer. */
+/** True for TTL media *and* for messages in a chat with an auto-delete timer. */
 export function isExpiring(msg) {
-  return isSelfDestruct(msg) || Number(msg?.ttlPeriod) > 0;
+  if (isSelfDestruct(msg)) return true;
+  const period = Number(msg?.ttlPeriod);
+  return Number.isFinite(period) && period > 0;
 }
 
 /**
  * Re-uploading as a plain file only makes sense where Telegram cannot rebuild
- * the original bubble (documents, stickers). Voice, round video and gif must
- * keep their native type or they lose playback behaviour.
+ * the original bubble. Voice, round video and gif must keep their native type
+ * or they lose their playback behaviour.
  */
 export function shouldForceDocument(msg) {
   const type = mediaType(msg);
@@ -105,95 +124,35 @@ export function sanitizeFilename(name, fallback = 'file') {
   const cleaned = String(name ?? '')
     .replace(UNSAFE_FILENAME, '_')
     .replace(/\s+/g, ' ')
+    .replace(/^\.+/, '')
     .trim();
   return (cleaned || fallback).slice(0, 120);
 }
 
 export function guessFilename(msg) {
-  const type = mediaType(msg) || 'media';
+  const type = mediaType(msg) ?? 'media';
   const named = findAttribute(msg, 'DocumentAttributeFilename');
   if (named?.fileName) return sanitizeFilename(named.fileName, `elegram_${msg?.id ?? 0}`);
-  const mime = msg?.document?.mimeType;
-  const ext = MIME_EXTENSIONS[mime] || TYPE_EXTENSIONS[type] || '.bin';
+  const ext = MIME_EXTENSIONS[msg?.document?.mimeType] ?? TYPE_EXTENSIONS[type] ?? '.bin';
   const prefix = type === 'photo' ? 'photo' : 'elegram';
   return `${prefix}_${msg?.id ?? 0}${ext}`;
 }
 
-/** Rebuilds document attributes so a re-uploaded file keeps its metadata. */
-export function rebuildAttributes(msg, fileName) {
-  if (!msg?.document) return [];
-  const out = [];
-  let hasFilename = false;
-  for (const attr of attributesOf(msg)) {
-    try {
-      switch (attr.className) {
-        case 'DocumentAttributeFilename':
-          out.push(new Api.DocumentAttributeFilename({ fileName }));
-          hasFilename = true;
-          break;
-        case 'DocumentAttributeAudio':
-          out.push(new Api.DocumentAttributeAudio({
-            voice: attr.voice,
-            duration: attr.duration,
-            title: attr.title,
-            performer: attr.performer,
-            waveform: attr.waveform,
-          }));
-          break;
-        case 'DocumentAttributeVideo':
-          out.push(new Api.DocumentAttributeVideo({
-            duration: attr.duration,
-            w: attr.w,
-            h: attr.h,
-            roundMessage: attr.roundMessage,
-            supportsStreaming: attr.supportsStreaming,
-            nosound: attr.nosound,
-          }));
-          break;
-        case 'DocumentAttributeImageSize':
-          out.push(new Api.DocumentAttributeImageSize({ w: attr.w, h: attr.h }));
-          break;
-        case 'DocumentAttributeAnimated':
-          out.push(new Api.DocumentAttributeAnimated());
-          break;
-        case 'DocumentAttributeSticker':
-          out.push(new Api.DocumentAttributeSticker({
-            alt: attr.alt,
-            stickerset: attr.stickerset,
-            maskCoords: attr.maskCoords,
-          }));
-          break;
-        default:
-          break;
-      }
-    } catch {
-      /* skip malformed attribute */
-    }
-  }
-  if (out.length && !hasFilename) {
-    out.unshift(new Api.DocumentAttributeFilename({ fileName }));
-  }
-  return out;
-}
-
-export function buildLink(msg) {
+/** Deep link back to the original message, when one can be built. */
+export function buildMessageLink(msg) {
   const id = msg?.id;
   if (!id) return '';
-  const chatId = msg?.chatId != null ? String(msg.chatId) : '';
+  const chatId = idStr(msg?.chatId);
   const username = msg?.chat?.username;
-  if (username) return `<a href="https://t.me/${username}/${id}">🔗 مشاهده پیام اصلی</a>`;
-  if (chatId.startsWith('-100')) {
-    return `<a href="https://t.me/c/${chatId.slice(4)}/${id}">🔗 مشاهده پیام اصلی</a>`;
-  }
-  if (/^\d+$/.test(chatId)) {
-    return `<a href="tg://openmessage?user_id=${chatId}&amp;message_id=${id}">🔗 مشاهده پیام اصلی</a>`;
-  }
+  if (username) return `https://t.me/${username}/${id}`;
+  if (chatId.startsWith('-100')) return `https://t.me/c/${chatId.slice(4)}/${id}`;
+  if (/^\d+$/.test(chatId)) return `tg://openmessage?user_id=${chatId}&message_id=${id}`;
   return '';
 }
 
 export function displayName(entity) {
   if (!entity) return '';
-  if (entity.title) return entity.title;
+  if (entity.title) return String(entity.title);
   const name = [entity.firstName, entity.lastName].filter(Boolean).join(' ').trim();
-  return name || entity.username || (entity.id != null ? String(entity.id) : '');
+  return name || (entity.username ? String(entity.username) : idStr(entity.id));
 }
