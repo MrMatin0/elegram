@@ -2,28 +2,43 @@
 import readline from 'node:readline/promises';
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
-import { config } from './config.js';
-import { log } from './utils/logger.js';
+import { config, configIssues } from './config.js';
+import { log, errText } from './utils/logger.js';
 
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+async function main() {
+  const issues = configIssues();
+  if (issues.length) {
+    for (const issue of issues) log.error(issue);
+    process.exitCode = 1;
+    return;
+  }
 
-const client = new TelegramClient(new StringSession(''), config.apiId, config.apiHash, {
-  deviceModel: config.deviceModel,
-});
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const client = new TelegramClient(new StringSession(''), config.apiId, config.apiHash, {
+    deviceModel: config.deviceModel,
+  });
 
-log.info('اتصال به تلگرام برای ساخت SESSION…');
-await client.start({
-  phoneNumber: async () => rl.question('📱 شماره تلفن (با کد کشور، مثال: +98912...): '),
-  phoneCode: async () => rl.question('🔑 کد دریافتی از تلگرام: '),
-  password: async () => rl.question('🔒 رمز تایید دو مرحله‌ای (اگر نداری خالی بگذار): '),
-  onError: (e) => log.error(e?.message || e),
-});
+  try {
+    log.info('اتصال به تلگرام برای ساخت SESSION…');
+    await client.start({
+      phoneNumber: () => rl.question('📱 شماره تلفن (با کد کشور، مثال: +98912...): '),
+      phoneCode: () => rl.question('🔑 کد دریافتی از تلگرام: '),
+      password: () => rl.question('🔒 رمز تایید دو مرحله‌ای (اگر نداری خالی بگذار): '),
+      onError: (error) => log.error(errText(error)),
+    });
+    log.ok('ورود موفق بود!');
+    console.log('\n🎉 مقدار زیر را در متغیر محیطی SESSION قرار بده:\n');
+    console.log(client.session.save());
+    console.log('');
+  } catch (error) {
+    log.error('ساخت SESSION ناموفق بود:', errText(error));
+    process.exitCode = 1;
+  } finally {
+    rl.close();
+    await client.disconnect().catch(() => {});
+    await client.destroy?.().catch(() => {});
+  }
+}
 
-log.ok('ورود موفق بود!');
-console.log('\n🎉 مقدار زیر را در متغیر محیطی SESSION قرار بده:\n');
-console.log(client.session.save());
-console.log('');
-
-await client.disconnect();
-rl.close();
-process.exit(0);
+await main();
+process.exit(process.exitCode ?? 0);

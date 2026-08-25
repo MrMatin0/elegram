@@ -2,114 +2,153 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Api } from 'telegram';
 import * as cards from '../ui/cards.js';
-import { humanBytes, esc, faDate } from '../utils/format.js';
+import { humanBytes, esc, faDate, joinWithin } from '../utils/format.js';
 import {
   isSelfDestruct,
   mediaKind,
   guessFilename,
   rebuildAttributes,
+  shouldForceDocument,
   buildLink,
   displayName,
 } from './mediaInfo.js';
-import { log } from '../utils/logger.js';
+import { withRetry } from '../utils/retry.js';
+import { log, errText } from '../utils/logger.js';
+
+const CAPTION_LIMIT = 1024;
+const TITLE_CACHE_LIMIT = 500;
+const PROGRESS_MIN_STEP = 10;
+const PROGRESS_MIN_INTERVAL = 2000;
 
 export class Archiver {
-  constructor(client, store, { tmpDir, dest }) {
+  constructor(client, store, { tmpDir, dest } = {}) {
     this.client = client;
     this.store = store;
     this.tmpDir = tmpDir;
-    this.dest = dest;
+    this.dest = dest || 'me';
     this.titles = new Map();
+    this._destPeer = null;
+  }
+
+  /** Resolves the archive destination once and falls back to Saved Messages. */
+  async resolveDest() {
+    if (this._destPeer) return this._destPeer;
+    try {
+      this._destPeer = await this.client.getInputEntity(this.dest);
+    } catch (error) {
+      if (this.dest !== 'me') {
+        log.warn(`مقصد آرشیو «${this.dest}» در دسترس نیست؛ Saved Messages استفاده می‌شود.`, errText(error));
+      }
+      this._destPeer = await this.client.getInputEntity('me');
+      this.dest = 'me';
+    }
+    return this._destPeer;
+  }
+
+  sendFile(options, label = 'sendFile') {
+    return withRetry(async () => this.client.sendFile(await this.resolveDest(), options), { label });
+  }
+
+  sendText(message) {
+    return withRetry(
+      async () => this.client.sendMessage(await this.resolveDest(), { message, parseMode: 'html', linkPreview: false }),
+      { label: 'sendMessage' },
+    );
   }
 
   cacheTitle(key, title) {
-    if (!title) return;
-    if (this.titles.size > 500) this.titles.clear();
+    if (!key || !title) return;
+    if (this.titles.size >= TITLE_CACHE_LIMIT) {
+      const oldest = this.titles.keys().next().value;
+      this.titles.delete(oldest);
+    }
     this.titles.set(key, title);
   }
 
-  async describe(msg) {
-    const d = {
-      kind: mediaKind(msg) || 'رسانه 📎',
-      size: Number(msg.file?.size || 0),
-      ttl: isSelfDestruct(msg),
-      chatTitle: '',
-      senderName: '',
-      date: faDate(new Date((msg.date || Math.floor(Date.now() / 1000)) * 1000)),
-      link: buildLink(msg),
-    };
-    const cid = msg.chatId != null ? String(msg.chatId) : '';
-    if (cid) {
-      d.chatTitle = this.titles.get(cid) || '';
-      if (!d.chatTitle && msg.chat) {
-        const t = displayName(msg.chat);
-        if (t) {
-          d.chatTitle = t;
-          this.cacheTitle(cid, t);
-        }
-      }
-      if (!d.chatTitle) {
-        try {
-          const entity = await this.client.getEntity(cid);
-          const t = displayName(entity);
-          if (t) {
-            d.chatTitle = t;
-            this.cacheTitle(cid, t);
-          }
-        } catch {}
+  async chatTitle(msg, chatId) {
+    if (!chatId) return '';
+    const cached = this.titles.get(chatId);
+    if (cached) return cached;
+    let title = msg.chat ? displayName(msg.chat) : '';
+    if (!title) {
+      try {
+        title = displayName(await this.client.getEntity(chatId));
+      } catch {
+        title = '';
       }
     }
-    const sid = msg.senderId != null ? String(msg.senderId) : '';
-    if (sid && sid === cid) {
-      d.senderName = d.chatTitle;
-    } else if (sid) {
+    this.cacheTitle(chatId, title);
+    return title;
+  }
+
+  async describe(msg) {
+    const chatId = msg?.chatId != null ? String(msg.chatId) : '';
+    const senderId = msg?.senderId != null ? String(msg.senderId) : '';
+    const seconds = Number(msg?.date) || Math.floor(Date.now() / 1000);
+    const info = {
+      kind: mediaKind(msg) || 'رسانه 📎',
+      size: Number(msg?.file?.size || 0),
+      ttl: isSelfDestruct(msg),
+      chatTitle: await this.chatTitle(msg, chatId),
+      senderName: '',
+      date: faDate(new Date(seconds * 1000)),
+      link: buildLink(msg),
+    };
+    if (senderId && senderId === chatId) {
+      info.senderName = info.chatTitle;
+    } else if (senderId) {
       let sender = msg.sender;
       if (!sender) {
         try {
-          sender = await this.client.getEntity(sid);
-        } catch {}
+          sender = await this.client.getEntity(senderId);
+        } catch {
+          sender = null;
+        }
       }
-      d.senderName = sender ? displayName(sender) : '';
+      info.senderName = sender ? displayName(sender) : '';
     }
-    return d;
+    return info;
   }
 
-  caption(d) {
-    const lines = ['📥 <b>آرشیو شد</b>', cards.LINE];
-    lines.push(`🗂 نوع: <b>${d.kind}</b>`);
-    if (d.size) lines.push(`💾 حجم: <b>${humanBytes(d.size)}</b>`);
-    if (d.chatTitle) lines.push(`💬 منبع: <b>${esc(d.chatTitle)}</b>`);
-    if (d.senderName && d.senderName !== d.chatTitle) lines.push(`👤 فرستنده: <b>${esc(d.senderName)}</b>`);
-    if (d.date) lines.push(`🗓 زمان اصلی: <i>${d.date}</i>`);
-    if (d.link) lines.push(d.link);
-    if (d.ttl) lines.push('', '⏳ <b>رسانه محوشونده — بلافاصله ذخیره شد</b>');
-    return lines.join('\n').slice(0, 1024);
+  caption(info) {
+    const lines = ['📥 <b>آرشیو شد</b>', cards.LINE, `🗂 نوع: <b>${esc(info.kind)}</b>`];
+    if (info.size) lines.push(`💾 حجم: <b>${humanBytes(info.size)}</b>`);
+    if (info.chatTitle) lines.push(`💬 منبع: <b>${esc(info.chatTitle)}</b>`);
+    if (info.senderName && info.senderName !== info.chatTitle) {
+      lines.push(`👤 فرستنده: <b>${esc(info.senderName)}</b>`);
+    }
+    if (info.date) lines.push(`🗓 زمان اصلی: <i>${esc(info.date)}</i>`);
+    if (info.link) lines.push(info.link);
+    if (info.ttl) lines.push('', '⏳ <b>رسانه محوشونده — بلافاصله ذخیره شد</b>');
+    return joinWithin(lines, CAPTION_LIMIT);
   }
 
-  albumMetaText(count, d) {
+  albumCaption(count, info) {
     const lines = [`🗃 <b>آلبومِ ${count} رسانه‌ای ذخیره شد</b>`, cards.LINE];
-    if (d.chatTitle) lines.push(`💬 منبع: <b>${esc(d.chatTitle)}</b>`);
-    if (d.senderName && d.senderName !== d.chatTitle) lines.push(`👤 فرستنده: <b>${esc(d.senderName)}</b>`);
-    if (d.date) lines.push(`🗓 زمان اصلی: <i>${d.date}</i>`);
-    if (d.link) lines.push(d.link);
-    return lines.join('\n').slice(0, 1024);
+    if (info.chatTitle) lines.push(`💬 منبع: <b>${esc(info.chatTitle)}</b>`);
+    if (info.senderName && info.senderName !== info.chatTitle) {
+      lines.push(`👤 فرستنده: <b>${esc(info.senderName)}</b>`);
+    }
+    if (info.date) lines.push(`🗓 زمان اصلی: <i>${esc(info.date)}</i>`);
+    if (info.link) lines.push(info.link);
+    return joinWithin(lines, CAPTION_LIMIT);
   }
 
   async safeEdit(message, text) {
+    if (!message) return;
     try {
       await message.edit({ text, parseMode: 'html', linkPreview: false });
-    } catch {}
+    } catch {
+      /* the status message may already be gone */
+    }
   }
 
   hide(message) {
-    message.delete().catch(() => {});
-  }
-
-  async fail(message, errText) {
-    await this.safeEdit(message, cards.errorCard(errText));
+    message?.delete?.().catch(() => {});
   }
 
   async react(msg) {
+    if (!msg?.id) return;
     try {
       const peer = await this.client.getInputEntity(msg.chatId);
       await this.client.invoke(new Api.messages.SendReaction({
@@ -117,137 +156,163 @@ export class Archiver {
         msgId: msg.id,
         reaction: [new Api.ReactionEmoji({ emoticon: '⚡️' })],
       }));
-    } catch {}
+    } catch {
+      /* reactions are cosmetic */
+    }
   }
 
-  progressHook(statusMsg, d) {
-    if (!statusMsg) return () => {};
-    let lastPct = -1;
+  /**
+   * One throttled reporter per job — the old code rebuilt it per file, which
+   * reset the throttle and spammed Telegram with edits.
+   */
+  createProgress(statusMsg, info) {
+    let stopped = false;
     let lastStage = '';
+    let lastPct = -1;
     let lastAt = 0;
-    return (stage, received, total) => {
-      const pct = total > 0 ? Math.min(100, Math.floor((received / total) * 100)) : 0;
+    const report = (stage, received, total) => {
+      if (stopped || !statusMsg) return;
+      const totalNum = Number(total) || 0;
+      const pct = totalNum > 0
+        ? Math.max(0, Math.min(100, Math.floor((Number(received) / totalNum) * 100)))
+        : 0;
       const now = Date.now();
-      if (stage !== lastStage || pct - lastPct >= 10 || now - lastAt > 1500) {
-        lastStage = stage;
-        lastPct = pct;
-        lastAt = now;
-        this.safeEdit(statusMsg, cards.progressCard({
-          stage,
-          pct,
-          kind: d.kind,
-          size: humanBytes(d.size),
-          urgent: d.ttl,
-        }));
-      }
+      const sameStage = stage === lastStage;
+      if (sameStage && pct - lastPct < PROGRESS_MIN_STEP && now - lastAt < PROGRESS_MIN_INTERVAL) return;
+      lastStage = stage;
+      lastPct = pct;
+      lastAt = now;
+      void this.safeEdit(statusMsg, cards.progressCard({
+        stage,
+        pct,
+        kind: info.kind,
+        size: humanBytes(info.size),
+        urgent: info.ttl,
+      }));
     };
+    report.stop = () => {
+      stopped = true;
+    };
+    return report;
   }
 
   async runJob(job) {
-    const { messages, statusMsg, explicit } = job;
+    const { statusMsg, explicit } = job;
+    const messages = (job.messages || []).filter((msg) => msg && msg.media);
+    if (!messages.length) return { bytes: 0, count: 0 };
     try {
-      let result;
-      if (messages.length === 1) {
-        result = await this.archiveSingleFlow(messages[0], statusMsg);
-      } else {
-        result = await this.archiveAlbum(messages, statusMsg);
-      }
-      this.store.countArchive(result.bytes);
-      if (statusMsg) this.hide(statusMsg);
-      if (explicit && messages[0]) await this.react(messages[0]);
+      const result = messages.length === 1
+        ? await this.archiveOne(messages[0], statusMsg)
+        : await this.archiveAlbum(messages, statusMsg);
+      this.store.countArchive(result.bytes, result.count);
+      this.hide(statusMsg);
+      if (explicit) await this.react(messages[0]);
+      log.ok(`آرشیو شد: ${result.count} مورد • ${humanBytes(result.bytes)} • روش ${result.method}`);
       return result;
-    } catch (e) {
-      const text = e?.errorMessage || e?.message || String(e);
+    } catch (error) {
+      const text = errText(error);
       log.error('آرشیو ناموفق:', text);
-      if (statusMsg) await this.fail(statusMsg, text);
-      throw e;
+      await this.safeEdit(statusMsg, cards.errorCard(text));
+      throw error;
     }
   }
 
-  async archiveSingleFlow(msg, statusMsg) {
-    const d = await this.describe(msg);
-    if (statusMsg) {
+  async archiveOne(msg, statusMsg) {
+    const info = await this.describe(msg);
+    const progress = this.createProgress(statusMsg, info);
+    try {
       await this.safeEdit(statusMsg, cards.progressCard({
         stage: 'download',
         pct: 0,
-        kind: d.kind,
-        size: humanBytes(d.size),
-        urgent: d.ttl,
+        kind: info.kind,
+        size: humanBytes(info.size),
+        urgent: info.ttl,
       }));
+      return await this.archiveMessage(msg, this.caption(info), progress, info);
+    } finally {
+      progress.stop();
     }
-    return this.archiveSingle(msg, this.caption(d), this.progressHook(statusMsg, d));
   }
 
-  async archiveSingle(msg, caption, hook) {
+  /**
+   * Fast path forwards the media reference; TTL media is always downloaded and
+   * re-uploaded, otherwise the archived copy would self-destruct as well.
+   */
+  async archiveMessage(msg, caption, progress, info) {
+    if (!info.ttl) {
+      try {
+        await this.sendFile({ file: msg.media, caption, parseMode: 'html', workers: 2 }, 'sendFile:direct');
+        return { bytes: Number(msg.file?.size || 0), count: 1, method: 'direct' };
+      } catch (error) {
+        log.warn('ارسال مستقیم ناموفق؛ دانلود و بازآپلود…', errText(error));
+      }
+    }
+    return this.reupload(msg, caption, progress);
+  }
+
+  async reupload(msg, caption, progress) {
+    const fileName = guessFilename(msg);
+    const tmpPath = path.join(this.tmpDir, `${msg.id ?? 0}_${Date.now().toString(36)}_${fileName}`);
     try {
-      await this.client.sendFile(this.dest, {
-        file: msg.media,
+      await fs.mkdir(this.tmpDir, { recursive: true });
+      progress?.('download', 0, Number(msg.file?.size || 0) || 1);
+      await withRetry(
+        () => this.client.downloadMedia(msg, {
+          outputFile: tmpPath,
+          progressCallback: (received, total) => progress?.('download', received, total),
+        }),
+        { label: 'downloadMedia' },
+      );
+      const stat = await fs.stat(tmpPath).catch(() => null);
+      if (!stat?.size) throw new Error('دانلود رسانه ناموفق بود (فایل خالی).');
+
+      const attributes = rebuildAttributes(msg, fileName);
+      const options = {
+        file: tmpPath,
         caption,
         parseMode: 'html',
+        forceDocument: shouldForceDocument(msg),
         workers: 2,
-      });
-      return { bytes: Number(msg.file?.size || 0), method: 'direct' };
-    } catch (e) {
-      log.warn('ارسال مستقیم ناموفق؛ دانلود و بازآپلود…', e?.errorMessage || e?.message || '');
-    }
-    const fileName = guessFilename(msg);
-    const tmpPath = path.join(this.tmpDir, `${msg.chatId ?? 'x'}_${msg.id}_${Date.now()}_${fileName}`);
-    hook?.('download', 0, 1);
-    await this.client.downloadMedia(msg, {
-      outputFile: tmpPath,
-      progressCallback: (r, t) => hook?.('download', r, t),
-    });
-    const stat = await fs.stat(tmpPath).catch(() => null);
-    const bytes = stat?.size || 0;
-    const attrs = rebuildAttributes(msg, fileName);
-    const hasAnim = attrs.some((a) => a.className === 'DocumentAttributeAnimated');
-    const hasVoice = attrs.some((a) => a.className === 'DocumentAttributeAudio' && a.voice);
-    const hasRound = attrs.some((a) => a.className === 'DocumentAttributeVideo' && a.roundMessage);
-    let forceDocument = /استیکر|داکیومنت|مسیج/.test(mediaKind(msg) || '');
-    if (hasAnim || hasVoice || hasRound) forceDocument = false;
-    const opts = {
-      file: tmpPath,
-      caption,
-      parseMode: 'html',
-      forceDocument,
-      workers: 2,
-      progressCallback: (r, t) => hook?.('upload', r, t),
-    };
-    if (attrs.length) opts.attributes = attrs;
-    try {
-      await this.client.sendFile(this.dest, opts);
+        progressCallback: (received, total) => progress?.('upload', received, total),
+      };
+      if (attributes.length) options.attributes = attributes;
+      await this.sendFile(options, 'sendFile:reupload');
+      return { bytes: stat.size, count: 1, method: 'reupload' };
     } finally {
-      fs.rm(tmpPath, { force: true }).catch(() => {});
+      await fs.rm(tmpPath, { force: true }).catch(() => {});
     }
-    return { bytes, method: 'reupload' };
   }
 
-  async archiveAlbum(msgs, statusMsg) {
-    const head = await this.describe(msgs[0]);
-    const bytes = msgs.reduce((sum, m) => sum + Number(m.file?.size || 0), 0);
+  async archiveAlbum(messages, statusMsg) {
+    const head = await this.describe(messages[0]);
+    const declared = messages.reduce((sum, msg) => sum + Number(msg.file?.size || 0), 0);
+    const hasTtl = messages.some(isSelfDestruct);
+    const progress = this.createProgress(statusMsg, head);
     try {
-      if (statusMsg) {
-        await this.safeEdit(statusMsg, cards.albumCard(msgs.length, head.kind, humanBytes(bytes)));
+      await this.safeEdit(statusMsg, cards.albumCard(messages.length, head.kind, humanBytes(declared)));
+      if (!hasTtl) {
+        try {
+          await this.sendFile({
+            file: messages.map((msg) => msg.media),
+            caption: this.albumCaption(messages.length, head),
+            parseMode: 'html',
+            workers: 3,
+          }, 'sendFile:album');
+          return { bytes: declared, count: messages.length, method: 'direct' };
+        } catch (error) {
+          log.warn('ارسال مستقیم آلبوم ناموفق؛ ذخیره تک‌تک…', errText(error));
+        }
       }
-      await this.client.sendFile(this.dest, {
-        file: msgs.map((m) => m.media),
-        workers: 3,
-      });
-    } catch (e) {
-      log.warn('آلبوم مستقیم ارسال نشد؛ روش جایگزین…', e?.errorMessage || e?.message || '');
-      let i = 0;
-      for (const m of msgs) {
-        const d = i === 0 ? head : await this.describe(m);
-        this.progressHook(statusMsg, d)('download', i + 1, msgs.length + 1);
-        await this.archiveSingle(m, this.caption(d), this.progressHook(statusMsg, d));
-        i += 1;
+      let bytes = 0;
+      for (const [index, msg] of messages.entries()) {
+        const info = index === 0 ? head : await this.describe(msg);
+        const item = await this.archiveMessage(msg, this.caption(info), progress, info);
+        bytes += item.bytes;
       }
+      await this.sendText(this.albumCaption(messages.length, head));
+      return { bytes: bytes || declared, count: messages.length, method: 'reupload' };
+    } finally {
+      progress.stop();
     }
-    await this.client.sendMessage(this.dest, {
-      message: this.albumMetaText(msgs.length, head),
-      parseMode: 'html',
-      linkPreview: false,
-    });
-    return { bytes };
   }
 }
