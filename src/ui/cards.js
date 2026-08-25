@@ -1,4 +1,4 @@
-import { humanBytes, humanDuration, progressBar, esc } from '../utils/format.js';
+import { humanBytes, humanDuration, progressBar, esc, truncate } from '../utils/format.js';
 
 export const LINE = '━━━━━━━━━━━━━━━━━━';
 const BRAND = '⚡️ <b>Elegram</b>';
@@ -36,9 +36,10 @@ export const statusCard = (s) => [
   '<b>🖥 سیستم</b>',
   `▫️ آپ‌تایم: <code>${humanDuration(s.uptime)}</code>`,
   `▫️ رم مصرفی: <code>${humanBytes(s.rss)}</code>`,
-  `▫️ نسخه Node: <code>${s.node}</code>`,
+  `▫️ نسخه Node: <code>${esc(s.node)}</code>`,
   '',
   '<b>🗄 آرشیو</b>',
+  `▫️ مقصد: <code>${esc(s.dest)}</code>`,
   `▫️ فایل‌های ذخیره‌شده: <b>${s.archived}</b>`,
   `▫️ حجم کل: <b>${humanBytes(s.bytes)}</b>`,
   `▫️ صف: <b>${s.pending}</b> در انتظار • <b>${s.running}</b> در حال پردازش`,
@@ -63,12 +64,11 @@ export const autoOff = (title) => [
 export const autoUsage = () =>
   ['⚠️ استفاده صحیح:', '', '<code>/auto on</code> یا <code>/auto off</code>'].join('\n');
 
-export const savedGuard = () =>
-  [
-    'ℹ️ اینجا <b>Saved Messages</b> خودت است!',
-    '',
-    'برای فعال‌سازی سیو خودکار، داخل چت موردنظر دستور <code>/auto on</code> را بفرست.',
-  ].join('\n');
+export const savedGuard = () => [
+  'ℹ️ اینجا <b>Saved Messages</b> خودت است!',
+  '',
+  'برای فعال‌سازی سیو خودکار، داخل چت موردنظر دستور <code>/auto on</code> را بفرست.',
+].join('\n');
 
 export const autoList = (map) => {
   const entries = Object.entries(map || {});
@@ -80,55 +80,56 @@ export const autoList = (map) => {
     ].join('\n');
   }
   const rows = entries
-    .map(([key, v], i) => `${i + 1}. <b>${esc(v?.title || key)}</b>\n    └ از ${humanDuration(Date.now() - (v?.since || Date.now()))} پیش`)
+    .map(([key, value], index) => {
+      const since = Number(value?.since) || Date.now();
+      return `${index + 1}. <b>${esc(value?.title || key)}</b>\n    └ از ${humanDuration(Date.now() - since)} پیش`;
+    })
     .join('\n');
   return [`🔁 <b>چت‌های دارای سیو خودکار (${entries.length})</b>`, LINE, rows].join('\n');
 };
 
-export const notReply = () =>
-  [
-    '🤔 پیامی برای ذخیره پیدا نکردم.',
-    '',
-    'روی پیام یا رسانه موردنظر <b>ریپلای</b> کن و بعد <code>/save</code> بفرست.',
-  ].join('\n');
+export const notReply = () => [
+  '🤔 پیامی برای ذخیره پیدا نکردم.',
+  '',
+  'روی پیام یا رسانه موردنظر <b>ریپلای</b> کن و بعد <code>/save</code> بفرست.',
+].join('\n');
 
-export const noMedia = () =>
-  ['🚫 در این پیام رسانه‌ای برای آرشیو وجود ندارد.'].join('\n');
+export const noMedia = () => '🚫 در این پیام رسانه‌ای برای آرشیو وجود ندارد.';
 
-export const queuedCard = ({ kind, size, pos, urgent }) =>
-  [
-    '📥 <b>در صف آرشیو…</b>',
-    LINE,
-    `🗂 نوع: <b>${kind}</b>`,
-    size && size !== '0 B' ? `💾 حجم: <b>${size}</b>` : '',
-    `📍 جایگاه در صف: <b>${pos}</b>`,
-    urgent ? '\n⚡️ <b>اولویت حداکثری — رسانه محوشونده!</b>' : '',
-  ].filter(Boolean).join('\n');
+export const queuedCard = ({ kind, size, pos, urgent }) => [
+  '📥 <b>در صف آرشیو…</b>',
+  LINE,
+  `🗂 نوع: <b>${esc(kind)}</b>`,
+  size && size !== '0 B' ? `💾 حجم: <b>${esc(size)}</b>` : '',
+  `📍 جایگاه در صف: <b>${pos}</b>`,
+  urgent ? '\n⚡️ <b>اولویت حداکثری — رسانه محوشونده!</b>' : '',
+].filter(Boolean).join('\n');
 
 export const progressCard = ({ stage, pct, kind, size, urgent }) => {
-  const label = stage === 'download' ? '⬇️ <b>در حال دانلود از منبع…</b>' : '⬆️ <b>در حال آپلود به آرشیو…</b>';
+  const label = stage === 'download'
+    ? '⬇️ <b>در حال دانلود از منبع…</b>'
+    : '⬆️ <b>در حال آپلود به آرشیو…</b>';
   return [
     '📦 <b>در حال آرشیو</b>',
     LINE,
     label,
     `<code>[${progressBar(pct)}] ${pct}%</code>`,
-    `🗂 ${kind}${size && size !== '0 B' ? ` • 💾 ${size}` : ''}`,
+    `🗂 ${esc(kind)}${size && size !== '0 B' ? ` • 💾 ${esc(size)}` : ''}`,
     urgent ? '⏳ رسانه محوشونده — با سرعت کامل!' : '',
   ].filter(Boolean).join('\n');
 };
 
-export const albumCard = (count, kind, size) =>
-  [
-    '🗃 <b>در حال آرشیو آلبوم</b>',
-    LINE,
-    `▫️ تعداد: <b>${count}</b> مورد`,
-    `▫️ حجم کل: <b>${size}</b>`,
-    kind ? `▫️ محتوا: <b>${kind}</b>` : '',
-  ].filter(Boolean).join('\n');
+export const albumCard = (count, kind, size) => [
+  '🗃 <b>در حال آرشیو آلبوم</b>',
+  LINE,
+  `▫️ تعداد: <b>${count}</b> مورد`,
+  `▫️ حجم کل: <b>${esc(size)}</b>`,
+  kind ? `▫️ محتوا: <b>${esc(kind)}</b>` : '',
+].filter(Boolean).join('\n');
 
-export const errorCard = (message) =>
-  [
-    '❌ <b>آرشیو ناموفق بود</b>',
-    LINE,
-    `<code>${esc(String(message || 'خطای ناشناخته')).slice(0, 300)}</code>`,
-  ].join('\n');
+// Escape *after* truncating, otherwise a cut can slice an HTML entity in half.
+export const errorCard = (message) => [
+  '❌ <b>آرشیو ناموفق بود</b>',
+  LINE,
+  `<code>${esc(truncate(message || 'خطای ناشناخته', 300))}</code>`,
+].join('\n');
