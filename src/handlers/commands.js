@@ -9,14 +9,15 @@ const ALBUM_SPAN = 10;
 export function createCommandHandler(ctx) {
   const { client, store, queue, me, archiver } = ctx;
 
-  // teleproto passes the *new text* as `message` and the target id as `id`.
-  // A failed edit is logged instead of swallowed — a silent catch here is what
-  // made the whole command path look dead.
+  // editMessage(entity, { message, text }): `message` is the *target id*, the
+  // new body goes in `text`. There is no `id` option — passing the text as
+  // `message` made the library look for a message id in a string, so every
+  // edit was rejected and every command looked dead.
   const edit = (msg, text) =>
     client
       .editMessage(msg.peerId ?? msg.chatId, {
-        message: text,
-        id: msg.id,
+        message: msg.id,
+        text,
         parseMode: 'html',
         linkPreview: false,
       })
