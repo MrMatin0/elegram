@@ -1,0 +1,20 @@
+{
+  "name": "elegram",
+  "version": "1.0.0",
+  "description": "Telegram self-bot for automatic media archiving — protected content, TTL media, albums, auto-save",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "login": "node src/login.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "big-integer": "^1.6.52",
+    "dotenv": "^16.4.5",
+    "telegram": "^2.26.22"
+  }
+}
