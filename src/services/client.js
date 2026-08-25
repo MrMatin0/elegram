@@ -1,9 +1,9 @@
 import { TelegramClient, Logger, errors } from 'teleproto';
-// teleproto publishes an "exports" map, so subpaths are the *documented* ones:
-// `teleproto/sessions`, `teleproto/events`, `teleproto/errors`. Appending
-// `/index.js` is not in the map and Node rejects it outright with
-// ERR_PACKAGE_PATH_NOT_EXPORTED — which is exactly why v1 never booted.
-import { StringSession } from 'teleproto/sessions';
+// teleproto's package.json has only "main" — no "exports" map — so subpaths are
+// resolved as plain paths on disk. `teleproto/sessions` is a directory, and ESM
+// rejects directory imports with ERR_UNSUPPORTED_DIR_IMPORT, so point at the
+// entry file itself. (The bare `teleproto` import above is fine: "main".)
+import { StringSession } from 'teleproto/sessions/index.js';
 import { log, errText, currentLogLevel } from '../utils/logger.js';
 
 const AUTH_FAILURES = new Set([
