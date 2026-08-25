@@ -1,26 +1,32 @@
 import 'dotenv/config';
 import path from 'node:path';
+import { LOG_LEVELS } from './utils/logger.js';
 
+/**
+ * Problems are collected instead of thrown at import time, so an entry point
+ * can report *every* misconfiguration at once and exit cleanly instead of
+ * dying on the first bad variable.
+ */
 const problems = [];
 
-const rawValue = (key) => {
+const raw = (key) => {
   const value = process.env[key];
   return typeof value === 'string' ? value.trim() : '';
 };
 
 function text(key, { required = false, fallback = '' } = {}) {
-  const value = rawValue(key);
+  const value = raw(key);
   if (!value) {
-    if (required) problems.push(`متغیر محیطی ${key} تنظیم نشده است.`);
+    if (required) problems.push(`متغیر محیطی ${key} تنطیم نشده است.`);
     return fallback;
   }
   return value;
 }
 
 function integer(key, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER, required = false } = {}) {
-  const value = rawValue(key);
+  const value = raw(key);
   if (!value) {
-    if (required) problems.push(`متغیر محیطی ${key} تنظیم نشده است.`);
+    if (required) problems.push(`متغیر محیطی ${key} تنطیم نشده است.`);
     return fallback;
   }
   const parsed = Number(value);
@@ -31,27 +37,87 @@ function integer(key, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER, requir
   return parsed;
 }
 
+function choice(key, fallback, allowed) {
+  const value = raw(key).toLowerCase();
+  if (!value) return fallback;
+  if (!allowed.includes(value)) {
+    problems.push(`متغیر محیطی ${key} باید یکی از این مقادیر باشد: ${allowed.join('، ')} (مقدار فعلی: ${value}).`);
+    return fallback;
+  }
+  return value;
+}
+
+function boolean(key, fallback) {
+  const value = raw(key).toLowerCase();
+  if (!value) return fallback;
+  if (['1', 'true', 'yes', 'on'].includes(value)) return true;
+  if (['0', 'false', 'no', 'off'].includes(value)) return false;
+  problems.push(`متغیر محیطی ${key} باید true یا false باشد (مقدار فعلی: ${value}).`);
+  return fallback;
+}
+
+/** A bad IANA zone used to silently degrade every date in every caption. */
+function timezone(key, fallback) {
+  const value = text(key, { fallback });
+  try {
+    new Intl.DateTimeFormat('fa-IR', { timeZone: value });
+    return value;
+  } catch {
+    problems.push(`متغیر محیطی ${key} یک منطقه زمانی معتبر نیست (مقدار فعلی: ${value}). از ${fallback} استفاده می‌شود.`);
+    return fallback;
+  }
+}
+
+const dataDir = path.resolve(text('DATA_DIR', { fallback: './data' }));
+
 export const config = Object.freeze({
   apiId: integer('API_ID', 0, { min: 1, required: true }),
   apiHash: text('API_HASH', { required: true }),
   session: text('SESSION'),
+
   storagePeer: text('STORAGE_PEER', { fallback: 'me' }),
+  dataDir,
+  tmpDir: path.join(dataDir, 'tmp'),
+  storeFile: path.join(dataDir, 'store.json'),
+
   port: integer('PORT', 3000, { min: 1, max: 65535 }),
-  dataDir: path.resolve(text('DATA_DIR', { fallback: './data' })),
   deviceModel: text('DEVICE_MODEL', { fallback: 'Elegram Desktop' }),
+  systemVersion: text('SYSTEM_VERSION', { fallback: `${process.platform} ${process.arch}` }),
+
   concurrency: integer('CONCURRENCY', 2, { min: 1, max: 8 }),
   albumWindowMs: integer('ALBUM_WINDOW_MS', 1200, { min: 200, max: 15000 }),
-  timezone: text('TIMEZONE', { fallback: 'Asia/Tehran' }),
+  uploadWorkers: integer('UPLOAD_WORKERS', 4, { min: 1, max: 16 }),
+  maxConcurrentDownloads: integer('MAX_CONCURRENT_DOWNLOADS', 4, { min: 1, max: 16 }),
+  // teleproto sleeps through any FLOOD_WAIT shorter than this by itself; longer
+  // ones still throw and are handled by our own retry/backoff.
+  floodSleepThreshold: integer('FLOOD_SLEEP_THRESHOLD', 60, { min: 0, max: 600 }),
+
+  timezone: timezone('TIMEZONE', 'Asia/Tehran'),
+  logLevel: choice('LOG_LEVEL', 'info', LOG_LEVELS),
+  // Empty string disables the cosmetic "done" reaction entirely.
+  doneReaction: raw('DONE_REACTION') || (process.env.DONE_REACTION === '' ? '' : '\u{1F44D}'),
+  catchUp: boolean('CATCH_UP', true),
 });
 
-/**
- * Config problems are collected instead of killing the process at import time,
- * so entry points can report every issue at once and exit gracefully.
- */
 export function configIssues({ requireSession = false } = {}) {
   const issues = [...problems];
   if (requireSession && !config.session) {
     issues.push('متغیر SESSION خالی است. ابتدا دستور `npm run login` را اجرا کن.');
   }
   return issues;
+}
+
+/** Safe to log: never exposes API_HASH or SESSION. */
+export function configSummary() {
+  return {
+    apiId: config.apiId,
+    storagePeer: config.storagePeer,
+    dataDir: config.dataDir,
+    port: config.port,
+    concurrency: config.concurrency,
+    uploadWorkers: config.uploadWorkers,
+    timezone: config.timezone,
+    logLevel: config.logLevel,
+    hasSession: Boolean(config.session),
+  };
 }
