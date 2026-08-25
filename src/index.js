@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { TelegramClient } from 'teleproto';
-import { StringSession } from 'teleproto/sessions/index.js';
+import { StringSession } from 'teleproto/sessions';
 import { config, configIssues } from './config.js';
 import { Store } from './store.js';
 import { startHealthServer, stopHealthServer } from './server.js';
@@ -47,9 +47,8 @@ async function bootstrap() {
     queue: ctx.queue?.pending ?? 0,
     running: ctx.queue?.running ?? 0,
     archived: store.data.stats.archived,
-    // Non-null once the update manager has its state: proof that Telegram is
-    // actually streaming updates to us and not just holding an open socket.
-    pts: ctx.client?.updates?.state?.pts ?? null,
+    // State of the MTProto socket itself, not just of this HTTP process.
+    socket: ctx.client?.connected ?? false,
   }));
 
   const client = new TelegramClient(
@@ -67,10 +66,6 @@ async function bootstrap() {
     },
   );
   ctx.client = client;
-
-  client.onError = async (error) => {
-    log.error('خطای کلاینت تلگرام:', errText(error));
-  };
 
   log.info('در حال اتصال به تلگرام…');
   await client.connect();

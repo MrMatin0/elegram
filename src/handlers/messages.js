@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { NewMessage } from 'teleproto/events/index.js';
+import { NewMessage } from 'teleproto/events';
 import { config } from '../config.js';
 import { Archiver } from '../services/archiver.js';
 import { TaskQueue } from '../services/queue.js';
@@ -27,8 +27,7 @@ export function registerHandlers(ctx) {
 
   const onCommand = createCommandHandler(ctx);
 
-  // The update manager drops duplicate message updates on its own; this only
-  // guards the same media arriving through a difference *and* a live update.
+  // Telegram can replay an update; without this a media file gets archived twice.
   const seen = new Set();
   const alreadyHandled = (msg) => {
     const key = `${msg.chatId ?? '?'}|${msg.id}`;
@@ -71,26 +70,39 @@ export function registerHandlers(ctx) {
     enqueue([msg], isExpiring(msg));
   };
 
-  // Two links in the update chain, each with its own filter. Service messages
-  // never build a NewMessage event, so they cost us nothing here.
-  const offCommands = client.updates.on(
-    new NewMessage({ outgoing: true, pattern: COMMAND_PATTERN }),
-    (event) => onCommand(event),
-  );
+  // Two builders, each with its own filter, so the library sorts commands from
+  // media for us. Callbacks guard themselves: teleproto has no chain-level
+  // error hook, and a throw inside a handler must not reach the update loop.
+  const commandFilter = new NewMessage({ outgoing: true, pattern: COMMAND_PATTERN });
+  const handleCommand = async (event) => {
+    try {
+      await onCommand(event);
+    } catch (error) {
+      log.error('خطای اجرای دستور:', errText(error));
+    }
+  };
 
-  const offMedia = client.updates.on(
-    new NewMessage({ incoming: true }),
-    (event) => onIncoming(event.message),
-  );
+  const mediaFilter = new NewMessage({ incoming: true });
+  const handleMedia = (event) => {
+    try {
+      const msg = event.message;
+      if (!msg || msg.service) return;
+      onIncoming(msg);
+    } catch (error) {
+      log.error('خطای پردازش رسانه:', errText(error));
+    }
+  };
 
-  client.updates.catch((error, update) => {
-    const kind = update?.className ? ` (${update.className})` : '';
-    log.error(`خطای پردازش آپدیت${kind}:`, errText(error));
-  });
+  // `addEventHandler(callback, builder)` is the whole subscription model in
+  // teleproto. There is no `client.updates` chain to hang handlers off, so the
+  // previous wiring registered nothing at all and every command went unheard.
+  client.addEventHandler(handleCommand, commandFilter);
+  client.addEventHandler(handleMedia, mediaFilter);
 
   ctx.dispose = () => {
-    offCommands();
-    offMedia();
+    // Removal needs the exact same callback *and* builder references.
+    client.removeEventHandler(handleCommand, commandFilter);
+    client.removeEventHandler(handleMedia, mediaFilter);
     albums.dispose();
     queue.clear('خاموشی سرویس');
   };
