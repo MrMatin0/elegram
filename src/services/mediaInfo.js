@@ -1,4 +1,4 @@
-import { Api } from 'telegram';
+import { Api } from 'teleproto';
 
 export const MEDIA_LABELS = {
   photo: 'عکس 🖼',
@@ -43,7 +43,7 @@ const MIME_EXTENSIONS = {
 
 const UNSAFE_FILENAME = /[\x00-\x1f\\/:*?"<>|]/g;
 
-/** gramjs sometimes hands back documents without an attributes array. */
+/** teleproto sometimes hands back documents without an attributes array. */
 function attributesOf(msg) {
   const list = msg?.document?.attributes;
   return Array.isArray(list) ? list : [];

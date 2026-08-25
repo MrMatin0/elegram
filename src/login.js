@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import readline from 'node:readline/promises';
-import { TelegramClient } from 'telegram';
-import { StringSession } from 'telegram/sessions/index.js';
+import { TelegramClient } from 'teleproto';
+import { StringSession } from 'teleproto/sessions/index.js';
 import { config, configIssues } from './config.js';
 import { log, errText } from './utils/logger.js';
 
