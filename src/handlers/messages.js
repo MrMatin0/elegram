@@ -1,5 +1,6 @@
 import path from 'node:path';
-import { NewMessage } from 'teleproto/events';
+// teleproto has no `exports` map, so ESM needs the explicit file, not the dir.
+import { NewMessage } from 'teleproto/events/index.js';
 import { config } from '../config.js';
 import { Archiver } from '../services/archiver.js';
 import { TaskQueue } from '../services/queue.js';

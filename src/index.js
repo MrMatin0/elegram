@@ -2,7 +2,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { TelegramClient } from 'teleproto';
-import { StringSession } from 'teleproto/sessions';
+// teleproto has no `exports` map, so ESM needs the explicit file, not the dir.
+import { StringSession } from 'teleproto/sessions/index.js';
 import { config, configIssues } from './config.js';
 import { Store } from './store.js';
 import { startHealthServer, stopHealthServer } from './server.js';
