@@ -46,6 +46,7 @@ async function main() {
     return 1;
   } finally {
     rl.close();
+    await client.disconnect().catch(() => {});
     await Promise.resolve(client.destroy?.()).catch(() => {});
   }
 }
