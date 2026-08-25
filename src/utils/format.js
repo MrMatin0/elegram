@@ -1,6 +1,8 @@
-import { config } from '../config.js';
-
-const UNITS = ['B', 'KB', 'MB', 'GB', 'TB'];
+/**
+ * Pure formatting helpers. No imports on purpose: this module is covered by the
+ * unit tests, which must run without a configured environment.
+ */
+const UNITS = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
 
 export function humanBytes(bytes) {
   const value = Number(bytes);
@@ -15,42 +17,55 @@ export function humanDuration(ms) {
   const days = Math.floor(total / 86400);
   const hours = Math.floor((total % 86400) / 3600);
   const minutes = Math.floor((total % 3600) / 60);
-  const seconds = total % 60;
   const bits = [];
   if (days) bits.push(`${days} روز`);
   if (hours) bits.push(`${hours} ساعت`);
   if (minutes) bits.push(`${minutes} دقیقه`);
-  if (!bits.length) bits.push(`${seconds} ثانیه`);
+  if (!bits.length) bits.push(`${total % 60} ثانیه`);
   return bits.join(' و ');
+}
+
+/** Clamps any input to an integer percentage. */
+export function percent(received, total) {
+  const done = Number(received);
+  const size = Number(total);
+  if (!Number.isFinite(done) || !Number.isFinite(size) || size <= 0) return 0;
+  return Math.max(0, Math.min(100, Math.floor((done / size) * 100)));
 }
 
 export function progressBar(pct, width = 14) {
   const value = Number(pct);
   const clamped = Math.max(0, Math.min(100, Number.isFinite(value) ? value : 0));
   const filled = Math.round((clamped / 100) * width);
-  return '█'.repeat(filled) + '░'.repeat(Math.max(0, width - filled));
+  return '\u2588'.repeat(filled) + '\u2591'.repeat(Math.max(0, width - filled));
 }
 
-export function faDate(date = new Date(), timeZone = config.timezone) {
+export function faDate(date = new Date(), timeZone) {
   const value = date instanceof Date ? date : new Date(date);
   if (Number.isNaN(value.getTime())) return '';
   const options = { dateStyle: 'medium', timeStyle: 'short' };
   try {
-    return value.toLocaleString('fa-IR', { ...options, timeZone });
+    return value.toLocaleString('fa-IR', timeZone ? { ...options, timeZone } : options);
   } catch {
+    // An invalid IANA zone must not cost us the whole caption.
     return value.toLocaleString('fa-IR', options);
   }
 }
 
+/** Escapes the three characters Telegram's HTML parse mode cares about. */
 export function esc(text = '') {
-  return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return String(text ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
-/** Truncates raw text before it is HTML escaped, so entities never get cut in half. */
+/** Truncate *before* escaping, otherwise a cut can slice an entity in half. */
 export function truncate(text, max) {
   const value = String(text ?? '');
-  if (max <= 0) return '';
-  return value.length <= max ? value : `${value.slice(0, Math.max(0, max - 1))}…`;
+  const limit = Number(max);
+  if (!Number.isFinite(limit) || limit <= 0) return '';
+  return value.length <= limit ? value : `${value.slice(0, Math.max(0, limit - 1))}\u2026`;
 }
 
 /**
@@ -58,13 +73,15 @@ export function truncate(text, max) {
  * slicing the result — a blind slice can cut an HTML tag and break parseMode.
  */
 export function joinWithin(lines, limit, separator = '\n') {
+  const max = Number(limit);
+  if (!Number.isFinite(max) || max <= 0) return '';
   const kept = [];
   let length = 0;
   for (const line of lines) {
     if (line == null) continue;
     const value = String(line);
     const cost = (kept.length ? separator.length : 0) + value.length;
-    if (length + cost > limit) break;
+    if (length + cost > max) break;
     kept.push(value);
     length += cost;
   }
