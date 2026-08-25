@@ -9,8 +9,20 @@ const ALBUM_SPAN = 10;
 export function createCommandHandler(ctx) {
   const { client, store, queue, me, archiver } = ctx;
 
+  // teleproto passes the *new text* as `message` and the target id as `id`.
+  // A failed edit is logged instead of swallowed — a silent catch here is what
+  // made the whole command path look dead.
   const edit = (msg, text) =>
-    msg.edit({ text, parseMode: 'html', linkPreview: false }).catch(() => {});
+    client
+      .editMessage(msg.peerId ?? msg.chatId, {
+        message: text,
+        id: msg.id,
+        parseMode: 'html',
+        linkPreview: false,
+      })
+      .catch((error) => {
+        log.warn('ویرایش پیام دستور ناموفق بود:', errText(error));
+      });
 
   async function peerOf(msg) {
     try {
