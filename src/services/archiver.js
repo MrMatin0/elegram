@@ -126,7 +126,7 @@ export class Archiver {
   }
 
   albumCaption(count, info) {
-    const lines = [`🗃 <b>آلبوم攏 ${count} رسانه‌ای ذخیره شد</b>`, cards.LINE];
+    const lines = [`🗃 <b>آلبوم ${count} رسانه‌ای ذخیره شد</b>`, cards.LINE];
     if (info.chatTitle) lines.push(`💬 منبع: <b>${esc(info.chatTitle)}</b>`);
     if (info.senderName && info.senderName !== info.chatTitle) {
       lines.push(`👤 فرستنده: <b>${esc(info.senderName)}</b>`);
@@ -136,13 +136,16 @@ export class Archiver {
     return joinWithin(lines, CAPTION_LIMIT);
   }
 
-  /** teleproto takes the new text as `message`, with the id in the same object. */
+  /**
+   * editMessage(entity, { message, text }): the target id goes in `message`,
+   * the new body in `text`. Keep them in that order or the edit is rejected.
+   */
   async safeEdit(message, text) {
     if (!message) return;
     try {
       await this.client.editMessage(peerOf(message), {
-        message: text,
-        id: message.id,
+        message: message.id,
+        text,
         parseMode: 'html',
         linkPreview: false,
       });
