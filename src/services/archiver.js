@@ -20,6 +20,8 @@ const PROGRESS_MIN_STEP = 10;
 const PROGRESS_MIN_INTERVAL = 2000;
 const DONE_REACTION = '⚡️';
 
+const peerOf = (msg) => msg?.peerId ?? msg?.chatId;
+
 export class Archiver {
   constructor(client, store, { tmpDir, dest } = {}) {
     this.client = client;
@@ -124,7 +126,7 @@ export class Archiver {
   }
 
   albumCaption(count, info) {
-    const lines = [`🗃 <b>آلبومِ ${count} رسانه‌ای ذخیره شد</b>`, cards.LINE];
+    const lines = [`🗃 <b>آلبوم攏 ${count} رسانه‌ای ذخیره شد</b>`, cards.LINE];
     if (info.chatTitle) lines.push(`💬 منبع: <b>${esc(info.chatTitle)}</b>`);
     if (info.senderName && info.senderName !== info.chatTitle) {
       lines.push(`👤 فرستنده: <b>${esc(info.senderName)}</b>`);
@@ -134,10 +136,16 @@ export class Archiver {
     return joinWithin(lines, CAPTION_LIMIT);
   }
 
+  /** teleproto takes the new text as `message`, with the id in the same object. */
   async safeEdit(message, text) {
     if (!message) return;
     try {
-      await message.edit({ text, parseMode: 'html', linkPreview: false });
+      await this.client.editMessage(peerOf(message), {
+        message: text,
+        id: message.id,
+        parseMode: 'html',
+        linkPreview: false,
+      });
     } catch {
       /* the status message may already be gone */
     }
@@ -151,7 +159,7 @@ export class Archiver {
   async react(msg) {
     if (!msg?.id) return;
     try {
-      await msg.react(DONE_REACTION);
+      await this.client.sendReaction(peerOf(msg), msg.id, DONE_REACTION);
     } catch {
       /* reactions are cosmetic */
     }
