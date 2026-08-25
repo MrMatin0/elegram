@@ -1,6 +1,5 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { Api } from 'telegram';
 import * as cards from '../ui/cards.js';
 import { humanBytes, esc, faDate, joinWithin } from '../utils/format.js';
 import {
@@ -19,6 +18,7 @@ const CAPTION_LIMIT = 1024;
 const TITLE_CACHE_LIMIT = 500;
 const PROGRESS_MIN_STEP = 10;
 const PROGRESS_MIN_INTERVAL = 2000;
+const DONE_REACTION = '⚡️';
 
 export class Archiver {
   constructor(client, store, { tmpDir, dest } = {}) {
@@ -147,15 +147,11 @@ export class Archiver {
     message?.delete?.().catch(() => {});
   }
 
+  /** Cosmetic "done" mark on the source message. */
   async react(msg) {
     if (!msg?.id) return;
     try {
-      const peer = await this.client.getInputEntity(msg.chatId);
-      await this.client.invoke(new Api.messages.SendReaction({
-        peer,
-        msgId: msg.id,
-        reaction: [new Api.ReactionEmoji({ emoticon: '⚡️' })],
-      }));
+      await msg.react(DONE_REACTION);
     } catch {
       /* reactions are cosmetic */
     }
