@@ -1,5 +1,6 @@
 import path from 'node:path';
-import { NewMessage } from 'teleproto/events';
+// 'teleproto/events' is a directory too, so ESM needs its index.js spelled out.
+import { NewMessage } from 'teleproto/events/index.js';
 import { config } from '../config.js';
 import { Archiver } from '../services/archiver.js';
 import { TaskQueue } from '../services/queue.js';
