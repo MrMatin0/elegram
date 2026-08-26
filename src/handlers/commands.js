@@ -1,6 +1,7 @@
 import * as cards from '../ui/cards.js';
 import { humanBytes } from '../utils/format.js';
 import { idStr, isSelfDestruct, mediaKind, mediaSize } from '../services/mediaInfo.js';
+import { resolveLinkedMessage } from '../services/lookup.js';
 import { isNotModified } from '../utils/retry.js';
 import { log, errText } from '../utils/logger.js';
 
@@ -38,6 +39,54 @@ export function createCommandHandler(ctx) {
   const chatLabel = (msg, chatKey) =>
     msg.chat?.title || msg.chat?.firstName || msg.chat?.username || `چت ${chatKey}`;
 
+  /** Deletes our own command for everyone. A failed cleanup never stops a save. */
+  const removeMessage = async (msg) => {
+    if (!msg?.id) return;
+    try {
+      if (typeof msg.delete === 'function') await msg.delete({ revoke: true });
+      else await client.deleteMessages(msg.peerId ?? msg.chatId, [msg.id], { revoke: true });
+    } catch (error) {
+      log.debug('حذف پیام دستور ناموفق بود:', errText(error));
+    }
+  };
+
+  /**
+   * True when the command already sits in the archive chat, so editing it in
+   * place leaves the card exactly where the user reads their archive.
+   *
+   * A custom STORAGE_PEER is a different chat by definition; only the default
+   * (`me` = Saved Messages) can be compared against our own id.
+   */
+  const inArchiveChat = (msg) => {
+    const chatKey = idStr(msg?.chatId);
+    if (!chatKey || !myId) return false;
+    if (archiver?.dest && archiver.dest !== 'me') return false;
+    return chatKey === myId;
+  };
+
+  /**
+   * Opens (or updates) the card for a `/save`.
+   *
+   * Inside the archive chat the command message *becomes* the card, as before.
+   * Anywhere else — groups, channels, other DMs — the command has already been
+   * deleted, so a fresh card is opened in the archive chat instead: a shared
+   * group never sees our queue/download/upload chatter.
+   *
+   * @returns the message the archiver may keep editing, or null.
+   */
+  const openCard = async (msg, text, local) => {
+    if (local) {
+      await edit(msg, text);
+      return msg;
+    }
+    try {
+      return await archiver.sendText(text);
+    } catch (error) {
+      log.warn('نوشتن کارت وضعیت در آرشیو ناموفق بود:', errText(error));
+      return null;
+    }
+  };
+
   /**
    * Collects every sibling of an album.
    *
@@ -45,13 +94,12 @@ export function createCommandHandler(ctx) {
    * up to 21 mostly-nonexistent ids and throws on some peers. Walking history
    * around the anchor is both cheaper and correct.
    */
-  async function collectAlbum(msg, anchor) {
+  async function collectAlbum(peer, anchor) {
     const groupId = idStr(anchor?.groupedId);
     if (!groupId) return [anchor];
 
     const found = new Map([[anchor.id, anchor]]);
     try {
-      const peer = await peerOf(msg);
       for await (const item of client.iterMessages(peer, {
         limit: ALBUM_SPAN * 3,
         offsetId: anchor.id + ALBUM_SPAN + 1,
@@ -121,24 +169,55 @@ export function createCommandHandler(ctx) {
       await edit(msg, cards.cancelCard(dropped));
     },
 
-    '/save': async (msg) => {
-      const reply = await msg.getReplyMessage().catch(() => null);
-      if (!reply) {
-        await edit(msg, cards.notReply());
+    /**
+     * Two ways to name a target:
+     *   `/save`        — replying to the media (works wherever we may post)
+     *   `/save <link>` — the post link, for channels with forwarding disabled,
+     *                    where there is nothing of ours to reply to.
+     *
+     * Outside the archive chat the command is deleted before any network work
+     * and every card is written to the archive chat, so a group is left clean.
+     */
+    '/save': async (msg, args) => {
+      const local = inArchiveChat(msg);
+      // Delete first, talk later: the trace must vanish even if the save fails.
+      if (!local) await removeMessage(msg);
+      const say = (text) => openCard(msg, text, local);
+
+      const argument = args.join(' ').trim();
+      let anchor = null;
+      let peer = null;
+
+      if (argument) {
+        // An explicit link outranks a reply: it is the more deliberate target.
+        const found = await resolveLinkedMessage(client, argument);
+        if (found.failure) {
+          await say(cards.linkError(found.failure));
+          return;
+        }
+        anchor = found.message;
+        peer = found.peer;
+      } else {
+        anchor = await msg.getReplyMessage().catch(() => null);
+        if (anchor) peer = await peerOf(msg);
+      }
+
+      if (!anchor) {
+        await say(cards.notReply());
         return;
       }
 
-      const targets = reply.groupedId ? await collectAlbum(msg, reply) : [reply];
+      const targets = anchor.groupedId ? await collectAlbum(peer, anchor) : [anchor];
       const media = targets.filter((item) => item?.media);
       if (!media.length) {
-        await edit(msg, cards.noMedia());
+        await say(cards.noMedia());
         return;
       }
       media.sort((a, b) => a.id - b.id);
 
       const head = media[0];
       const urgent = media.some(isSelfDestruct);
-      await edit(msg, cards.queuedCard({
+      const statusMsg = await say(cards.queuedCard({
         kind: mediaKind(head) ?? 'رسانه \u{1F4CE}',
         size: humanBytes(media.reduce((sum, item) => sum + mediaSize(item), 0)),
         pos: queue.positionFor({ priority: urgent }),
@@ -147,7 +226,7 @@ export function createCommandHandler(ctx) {
 
       // Failures are already surfaced on the status message by the archiver.
       await queue
-        .add({ messages: media, statusMsg: msg, explicit: true }, { priority: urgent })
+        .add({ messages: media, statusMsg, explicit: true }, { priority: urgent })
         .catch(() => {});
     },
   };
