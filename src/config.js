@@ -14,6 +14,9 @@ const raw = (key) => {
   return typeof value === 'string' ? value.trim() : '';
 };
 
+/** True when the variable exists at all, however empty its value is. */
+const isSet = (key) => typeof process.env[key] === 'string';
+
 function text(key, { required = false, fallback = '' } = {}) {
   const value = raw(key);
   if (!value) {
@@ -56,6 +59,17 @@ function boolean(key, fallback) {
   return fallback;
 }
 
+/**
+ * An opt-out string: setting the variable to nothing (or to whitespace) is a
+ * deliberate "turn this off", while leaving it unset keeps the default.
+ *
+ * The previous form read `process.env` twice to tell those two cases apart,
+ * which also meant a whitespace-only value silently fell back to the default.
+ */
+function optOut(key, fallback) {
+  return isSet(key) ? raw(key) : fallback;
+}
+
 /** A bad IANA zone used to silently degrade every date in every caption. */
 function timezone(key, fallback) {
   const value = text(key, { fallback });
@@ -78,7 +92,6 @@ export const config = Object.freeze({
   storagePeer: text('STORAGE_PEER', { fallback: 'me' }),
   dataDir,
   tmpDir: path.join(dataDir, 'tmp'),
-  storeFile: path.join(dataDir, 'store.json'),
 
   port: integer('PORT', 3000, { min: 1, max: 65535 }),
   deviceModel: text('DEVICE_MODEL', { fallback: 'Elegram Desktop' }),
@@ -94,8 +107,8 @@ export const config = Object.freeze({
 
   timezone: timezone('TIMEZONE', 'Asia/Tehran'),
   logLevel: choice('LOG_LEVEL', 'info', LOG_LEVELS),
-  // Empty string disables the cosmetic "done" reaction entirely.
-  doneReaction: raw('DONE_REACTION') || (process.env.DONE_REACTION === '' ? '' : '\u{1F44D}'),
+  // An empty DONE_REACTION disables the cosmetic "done" reaction entirely.
+  doneReaction: optOut('DONE_REACTION', '\u{1F44D}'),
   catchUp: boolean('CATCH_UP', true),
 });
 

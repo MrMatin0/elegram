@@ -1,6 +1,6 @@
 {
   "name": "elegram",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "Telegram self-bot for automatic media archiving — protected content, TTL media, albums, auto-save, live message mirroring",
   "type": "module",
   "main": "src/index.js",

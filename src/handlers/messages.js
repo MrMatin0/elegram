@@ -147,8 +147,13 @@ export function registerHandlers(ctx, config) {
   // before we ever see them instead of re-checking `out` by hand.
   subscribe('NewMessage(commands)', events.NewMessage, { outgoing: true, pattern: COMMAND_PATTERN }, handleCommand);
   subscribe('NewMessage(incoming)', events.NewMessage, { incoming: true }, handleIncoming);
-  const watching = subscribe('EditedMessage', events.EditedMessage, {}, handleEdited)
-    && subscribe('DeletedMessage', events.DeletedMessage, {}, handleDeleted);
+
+  // Both subscriptions are attempted, always. Chaining them with `&&` meant a
+  // build missing only `EditedMessage` never even tried to register the delete
+  // handler — losing the one feature that cannot be recovered after the fact.
+  const watchesEdits = subscribe('EditedMessage', events.EditedMessage, {}, handleEdited);
+  const watchesDeletes = subscribe('DeletedMessage', events.DeletedMessage, {}, handleDeleted);
+  const watching = watchesEdits && watchesDeletes;
 
   ctx.dispose = () => {
     for (const [callback, builder] of subscriptions) client.removeEventHandler(callback, builder);

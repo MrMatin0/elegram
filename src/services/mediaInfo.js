@@ -48,7 +48,15 @@ const MIME_EXTENSIONS = {
   'application/x-tgsticker': '.tgs',
 };
 
-const UNSAFE_FILENAME = /[-\u001f\\/:*?"<>|]/g;
+/**
+ * Every character a file name must not carry: the C0 control range, DEL, and
+ * the separators/reserved characters POSIX and Windows choke on.
+ *
+ * The leading `\x00-` is what makes this a *range*. Written without it the dash
+ * was a literal member of the class, so control bytes sailed through while
+ * every hyphen in a perfectly good file name got rewritten to `_`.
+ */
+const UNSAFE_FILENAME = /[\x00-\x1f\x7f\\/:*?"<>|]/g;
 
 /** Telegram ids arrive as BigInt-like objects; never compare them with `===`. */
 export const idStr = (value) => (value == null ? '' : String(value));
