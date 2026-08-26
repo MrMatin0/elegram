@@ -118,7 +118,7 @@ async function bootstrap() {
   // A process that keeps running after an uncaught exception is a process in an
   // unknown state. Log it, flush the store, and let the supervisor restart us.
   process.on('uncaughtException', (error) => {
-    log.error('خطای غیرمنتطره:', errText(error));
+    log.error('خطای غیرمنتظره:', errText(error));
     void shutdown('UNCAUGHT_EXCEPTION', 1);
   });
 }

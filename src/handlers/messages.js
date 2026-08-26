@@ -162,7 +162,7 @@ export function registerHandlers(ctx, config) {
     queue.close('خاموشی سرویس');
   };
 
-  log.ok('هندلرها فعال شدند — منتطر پیام‌ها…');
+  log.ok('هندلرها فعال شدند — منتظر پیام‌ها…');
   if (store.mirrorCount) {
     log.info(`آینه فعال روی ${store.mirrorCount} چت${watching ? '' : ' (بدون رهگیری ویرایش/حذف)'}`);
   }
