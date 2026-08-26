@@ -1,3 +1,4 @@
+import { LINK_FAILURES } from '../utils/links.js';
 import { humanBytes, humanDuration, progressBar, esc, truncate } from '../utils/format.js';
 
 export const LINE = '\u2501'.repeat(18);
@@ -16,6 +17,7 @@ export const helpCard = () => block([
   LINE,
   '<b>\u{1F3AE} دستورات</b>',
   '\u25AA\uFE0F <code>/save</code> — روی رسانه ریپلای کن و بفرست (حتی ضدفوروارد)',
+  '\u25AA\uFE0F <code>/save &lt;لینک پست&gt;</code> — وقتی جایی برای ریپلای نیست',
   '\u25AA\uFE0F <code>/auto on</code> | <code>/auto off</code> — سیو خودکار همین چت',
   '\u25AA\uFE0F <code>/autolist</code> — چت‌های دارای سیو خودکار',
   '\u25AA\uFE0F <code>/status</code> — آمار و وضعیت سیستم',
@@ -29,6 +31,7 @@ export const helpCard = () => block([
   '\u25AB\uFE0F آلبوم، استیکر، وویس، ویدیو و همه فرمت‌ها بدون افت کیفیت',
   LINE,
   '\u{1F4A1} <i>رسانه‌های یک‌بارمصرف بدون هیچ دستوری سیو می‌شوند.</i>',
+  '\u{1F92B} <i>خارج از Saved Messages، پیام دستور فوراً پاک می‌شود و گزارش فقط در آرشیو نوشته می‌شود.</i>',
 ]);
 
 export const pingCard = ({ latency, uptime }) => block([
@@ -107,11 +110,48 @@ export const autoList = (entries) => {
   return block([`\u{1F501} <b>چت‌های دارای سیو خودکار (${list.length})</b>`, LINE, rows]);
 };
 
+/** Usage lines shared by the "no target" and "bad link" cards. */
+const SAVE_USAGE = [
+  '\u25AA\uFE0F روی رسانه <b>ریپلای</b> کن و <code>/save</code> بفرست.',
+  '\u25AA\uFE0F یا لینک پست را جلوی دستور بگذار:',
+  '<code>/save https://t.me/channel/1234</code>',
+  '<code>/save https://t.me/c/1234567890/1234</code>',
+];
+
 export const notReply = () => compact([
   '\u{1F914} پیامی برای ذخیره پیدا نکردم.',
   '',
-  'روی پیام یا رسانه موردنظر <b>ریپلای</b> کن و بعد <code>/save</code> بفرست.',
+  ...SAVE_USAGE,
 ]);
+
+/**
+ * `/save <link>` failures.
+ *
+ * One card per reason, because «نشد» is useless when the fix — عضو شدن در کانال
+ * یا درست کردن شماره پیام — depends on which step failed.
+ */
+export const linkError = (reason) => {
+  if (reason === LINK_FAILURES.PEER) {
+    return compact([
+      '\u{1F6A7} <b>به این چت دسترسی ندارم.</b>',
+      '',
+      'اگر کانال یا گروه خصوصی است، اول باید با همین اکانت عضوش باشی.',
+      '\u{1F4A1} یک بار چت را در تلگرام باز کن تا شناخته شود، بعد دوباره <code>/save</code> بزن.',
+    ]);
+  }
+  if (reason === LINK_FAILURES.MESSAGE) {
+    return compact([
+      '\u{1F50D} <b>پیامی با این لینک پیدا نشد.</b>',
+      '',
+      'شماره پیام را دوباره چک کن؛ ممکن است پاک شده باشد.',
+    ]);
+  }
+  return compact([
+    '\u{1F517} <b>این یک لینک پیام تلگرام نیست.</b>',
+    '',
+    ...SAVE_USAGE,
+  ]);
+};
 
 export const noMedia = () => '\u{1F6AB} در این پیام رسانه‌ای برای آرشیو وجود ندارد.';
 
