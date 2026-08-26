@@ -41,7 +41,18 @@ async function bootstrap() {
   };
 
   let shuttingDown = false;
-  let shutdown = async () => {};
+  /**
+   * Placeholder until the real handler is wired below.
+   *
+   * It must still *exit*: the health server can die of a port clash seconds
+   * before this gets replaced, and a no-op stub left a process that looks alive
+   * to the supervisor and answers nothing — exactly the failure the loud
+   * `onFatal` was added to prevent.
+   */
+  let shutdown = async (signal, code = 1) => {
+    log.error(`${signal} پیش از آماده شدن سرویس رخ داد؛ خروج.`);
+    process.exit(code);
+  };
 
   // The health endpoint comes up before Telegram so a platform probe (Railway,
   // Fly, K8s) does not fail while the MTProto socket is still connecting.
@@ -65,7 +76,7 @@ async function bootstrap() {
       // State of the socket itself, not just of this HTTP process.
       socket: Boolean(ctx.client?.connected),
     }),
-    { onFatal: () => shutdown('HEALTH_SERVER_FAILED', 1) },
+    { onFatal: () => void shutdown('HEALTH_SERVER_FAILED', 1) },
   );
 
   const client = createClient(config, { appVersion: pkg.version });
@@ -107,7 +118,7 @@ async function bootstrap() {
   // A process that keeps running after an uncaught exception is a process in an
   // unknown state. Log it, flush the store, and let the supervisor restart us.
   process.on('uncaughtException', (error) => {
-    log.error('خطای غیرمنتظره:', errText(error));
+    log.error('خطای غیرمنتطره:', errText(error));
     void shutdown('UNCAUGHT_EXCEPTION', 1);
   });
 }
