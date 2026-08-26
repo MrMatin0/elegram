@@ -1,15 +1,14 @@
 import * as cards from '../ui/cards.js';
 import { faDate } from '../utils/format.js';
-import { LruMap } from '../utils/lru.js';
-import { buildMessageLink, displayName, idStr, mediaKind } from './mediaInfo.js';
+import { LruMap, LruSet } from '../utils/lru.js';
+import { idStr } from './mediaInfo.js';
 import { log, errText } from '../utils/logger.js';
 
 const SNAPSHOT_LIMIT = 4000;
-const TITLE_CACHE_LIMIT = 300;
-// Telegram punishes bursts of *sends* far harder than edits, and a mirrored
-// group can easily produce messages faster than we are allowed to write them.
-// Every card therefore goes through one serialized lane with a floor between
-// sends; ordering is a feature here, not a side effect.
+// Telegram punishes bursts of *writes* far harder than reads, and a mirrored
+// group can easily produce messages faster than we are allowed to archive them.
+// Everything therefore goes through one serialized lane with a floor between
+// calls; ordering is a feature here, not a side effect.
 const MIN_SEND_GAP_MS = 400;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
@@ -17,20 +16,21 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, N
 /** `message` is the raw text; `text` is teleproto's formatted view of it. */
 const textOf = (msg) => String(msg?.message ?? msg?.text ?? '').trim();
 
-const secondsOf = (msg) => Number(msg?.date) || Math.floor(Date.now() / 1000);
-
 /**
  * Live message mirroring.
  *
- * For every chat the user marked with `.mirror on`, the first sighting of a
- * message is copied into the archive. That copy is the *original*: whatever
- * happens to the message afterwards — an edit, a delete-for-everyone — is
- * reported as a reply to that copy instead of overwriting it.
+ * For every chat the user marked with `.mirror`, the first sighting of a message
+ * is archived **as it is** — a forward when Telegram allows one, a byte-for-byte
+ * copy when it does not. Nothing of ours is added to that copy: no card, no
+ * caption, no header.
  *
- * Why snapshots instead of re-reading the message: once Telegram delivers
- * `updateDeleteMessages` the message is already gone, so the only version that
- * still exists anywhere is the one we kept in memory. Hence a bounded LRU that
- * is written on sight and never on demand.
+ * Whatever happens to the message afterwards (an edit, a delete-for-everyone) is
+ * reported as a short notice *in reply to* that copy, so one archived message
+ * carries its own history in a thread.
+ *
+ * The `source_chat_id + source_message_id → saved_message_id` pair is the whole
+ * mechanism, and it is written to the store, not just to memory: an edit that
+ * lands after a restart still finds its anchor.
  */
 export class MirrorService {
   constructor(client, store, archiver, {
@@ -49,29 +49,33 @@ export class MirrorService {
     // `updateDeleteMessages` carries no peer for users and basic groups, where
     // message ids are unique per account — so a plain id index closes that gap.
     this.byMessageId = new LruMap(limit);
-    this.titles = new LruMap(TITLE_CACHE_LIMIT);
+    // Deletes resolved from disk have no snapshot to mark, so they get their own
+    // de-duplication: Telegram happily replays an update after a reconnect.
+    this.reported = new LruSet(limit);
+    // cacheKey → in-flight archive. An edit or delete that arrives while the
+    // copy is still being written waits for it instead of losing its anchor.
+    this.inFlight = new Map();
     this.stats = { captured: 0, edits: 0, deletions: 0 };
     this._chain = Promise.resolve();
-    this._nextSendAt = 0;
+    this._nextAt = 0;
   }
 
-  // ------------------------------------------------------------------- sending
+  // ---------------------------------------------------------------------- lane
 
-  /** One serialized, rate-floored lane for every mirror card. Never throws. */
-  send(text, replyTo = null) {
-    const run = async () => {
-      if (!text) return null;
-      const wait = this._nextSendAt - Date.now();
+  /** One serialized, rate-floored lane for every Telegram write. Never throws. */
+  _lane(run) {
+    const task = async () => {
+      const wait = this._nextAt - Date.now();
       if (wait > 0) await sleep(wait);
-      this._nextSendAt = Date.now() + this.sendGapMs;
+      this._nextAt = Date.now() + this.sendGapMs;
       try {
-        return await this.archiver.sendText(text, replyTo ? { replyTo } : undefined);
+        return await run();
       } catch (error) {
-        log.warn('[mirror] نوشتن کارت آینه ناموفق بود:', errText(error));
+        log.warn('[mirror] نوشتن در آرشیو ناموفق بود:', errText(error));
         return null;
       }
     };
-    this._chain = this._chain.then(run, run);
+    this._chain = this._chain.then(task, task);
     return this._chain;
   }
 
@@ -79,47 +83,6 @@ export class MirrorService {
 
   key(chatKey, id) {
     return `${chatKey || '?'}|${id}`;
-  }
-
-  async chatTitle(msg, chatKey) {
-    if (!chatKey) return '';
-    const cached = this.titles.get(chatKey);
-    if (cached != null) return cached;
-    let title = '';
-    try {
-      title = msg?.chat ? displayName(msg.chat) : '';
-    } catch {
-      title = '';
-    }
-    if (!title) {
-      try {
-        title = displayName(await this.client.getEntity(chatKey));
-      } catch {
-        title = '';
-      }
-    }
-    this.titles.set(chatKey, title);
-    return title;
-  }
-
-  /** Empty for a channel post or a DM, where the chat *is* the sender. */
-  async senderName(msg, chatKey) {
-    const senderId = idStr(msg?.senderId);
-    if (!senderId || senderId === chatKey) return '';
-    let sender = null;
-    try {
-      sender = msg.sender ?? null;
-    } catch {
-      sender = null;
-    }
-    if (!sender) {
-      try {
-        sender = await this.client.getEntity(senderId);
-      } catch {
-        sender = null;
-      }
-    }
-    return sender ? displayName(sender) : `کاربر ${senderId}`;
   }
 
   _index(snapshot) {
@@ -144,6 +107,20 @@ export class MirrorService {
     return this.snapshots.get(this.key(chatKey, id)) ?? null;
   }
 
+  /**
+   * The archived copy a notice must reply to.
+   *
+   * The await is the race fix: a delete-for-everyone can beat our own upload,
+   * and without waiting the notice would drift off on its own instead of
+   * hanging under the copy it belongs to.
+   */
+  async _anchor(chatKey, id, snapshot = null) {
+    if (snapshot?.savedId) return snapshot.savedId;
+    const waiting = this.inFlight.get(this.key(chatKey, id));
+    if (waiting) await waiting;
+    return snapshot?.savedId || this.store.savedIdFor(chatKey, id) || null;
+  }
+
   // -------------------------------------------------------------------- events
 
   /**
@@ -153,33 +130,37 @@ export class MirrorService {
   async capture(msg) {
     try {
       const chatKey = idStr(msg?.chatId);
-      if (!chatKey || !msg?.id) return null;
+      const id = Number(msg?.id);
+      if (!chatKey || !Number.isFinite(id) || id <= 0) return null;
       // Telegram replays updates after a reconnect; the first copy wins.
-      const cacheKey = this.key(chatKey, msg.id);
+      const cacheKey = this.key(chatKey, id);
       if (this.snapshots.has(cacheKey)) return null;
 
-      const text = textOf(msg);
       const snapshot = {
         cacheKey,
-        id: msg.id,
+        id,
         chatKey,
-        chatTitle: await this.chatTitle(msg, chatKey),
-        senderName: await this.senderName(msg, chatKey),
-        kind: msg?.media ? mediaKind(msg) ?? '' : '',
-        date: faDate(new Date(secondsOf(msg) * 1000), this.timezone),
-        link: buildMessageLink(msg),
-        original: text,
-        text,
+        text: textOf(msg),
         revisions: 0,
         deleted: false,
-        cardId: null,
+        savedId: null,
       };
       this.snapshots.set(cacheKey, snapshot);
       this._index(snapshot);
       this.stats.captured += 1;
 
-      const card = await this.send(cards.mirrorCard(snapshot));
-      snapshot.cardId = card?.id ?? null;
+      const job = this._lane(() => this.archiver.archiveAsIs(msg)).then((sent) => {
+        const savedId = Number(sent?.id);
+        snapshot.savedId = Number.isFinite(savedId) && savedId > 0 ? savedId : null;
+        if (snapshot.savedId) this.store.rememberMirror(chatKey, id, snapshot.savedId);
+        return snapshot.savedId;
+      });
+      this.inFlight.set(cacheKey, job);
+      try {
+        await job;
+      } finally {
+        this.inFlight.delete(cacheKey);
+      }
       return snapshot;
     } catch (error) {
       log.error('[mirror] ثبت پیام ناموفق بود:', errText(error));
@@ -187,39 +168,41 @@ export class MirrorService {
     }
   }
 
+  /** A short notice, in reply to the archived copy. Never throws. */
+  _notify(text, replyTo) {
+    return this._lane(() => this.archiver.sendText(text, replyTo ? { replyTo } : undefined));
+  }
+
   /**
-   * A message we already mirrored was edited.
+   * A message we already archived was edited.
    *
    * Telegram also emits an edit update for churn that changes no text at all
    * (pinning, media re-render, our own status-card edits), so an unchanged body
-   * is dropped instead of posting a card that says nothing.
+   * is dropped instead of posting a notice that says nothing.
    */
   async onEdit(msg) {
     try {
       const chatKey = idStr(msg?.chatId);
-      const snapshot = this.get(chatKey, msg?.id);
-      if (!snapshot || snapshot.deleted) return null;
+      const id = Number(msg?.id);
+      if (!chatKey || !Number.isFinite(id) || id <= 0) return null;
       if (!this.store.isMirror(chatKey)) return null;
 
+      const snapshot = this.get(chatKey, id);
       const next = textOf(msg);
-      const previous = snapshot.text;
-      if (next === previous) return null;
+      if (snapshot) {
+        if (snapshot.deleted) return null;
+        if (next === snapshot.text) return null;
+        snapshot.text = next;
+        snapshot.revisions += 1;
+      }
 
-      snapshot.revisions += 1;
-      snapshot.text = next;
+      const anchor = await this._anchor(chatKey, id, snapshot);
+      // No snapshot and no stored pair means this message was never mirrored.
+      if (!snapshot && !anchor) return null;
+
       this.stats.edits += 1;
-
-      await this.send(cards.mirrorEditCard({
-        chatTitle: snapshot.chatTitle,
-        senderName: snapshot.senderName,
-        link: snapshot.link,
-        original: snapshot.original,
-        previous,
-        next,
-        revisions: snapshot.revisions,
-        at: faDate(new Date(), this.timezone),
-      }), snapshot.cardId);
-      return snapshot;
+      await this._notify(cards.mirrorEditNotice({ at: faDate(new Date(), this.timezone), text: next }), anchor);
+      return snapshot ?? { chatKey, id, savedId: anchor, text: next, revisions: 1, deleted: false };
     } catch (error) {
       log.error('[mirror] ثبت ویرایش ناموفق بود:', errText(error));
       return null;
@@ -237,21 +220,35 @@ export class MirrorService {
       for (const raw of list) {
         const id = Number(raw);
         if (!Number.isFinite(id) || id <= 0) continue;
+
         const snapshot = chatKey ? this.get(chatKey, id) : this._findById(id);
-        // No snapshot means we never mirrored it (our own commands land here).
-        if (!snapshot || snapshot.deleted) continue;
-        if (!this.store.isMirror(snapshot.chatKey)) continue;
-        snapshot.deleted = true;
-        hits.push(snapshot);
+        if (snapshot) {
+          if (snapshot.deleted) continue;
+          if (!this.store.isMirror(snapshot.chatKey)) continue;
+          // Claimed *before* any await, so a replayed update is a no-op.
+          snapshot.deleted = true;
+          this.reported.add(snapshot.cacheKey);
+          hits.push(snapshot);
+          continue;
+        }
+
+        // A restart drops the snapshots but not the stored pairs, so a delete
+        // can still be reported against the copy it belongs to.
+        const savedId = chatKey ? this.store.savedIdFor(chatKey, id) : 0;
+        const found = savedId
+          ? { chatKey, id, savedId }
+          : (chatKey ? null : this.store.findMirrorById(id));
+        if (!found?.savedId) continue;
+        if (!this.store.isMirror(found.chatKey)) continue;
+        if (this.reported.add(this.key(found.chatKey, found.id))) continue;
+        hits.push({ ...found, deleted: true, revisions: 0, fromStore: true });
       }
       if (!hits.length) return [];
 
       this.stats.deletions += hits.length;
-      for (const snapshot of hits) {
-        await this.send(cards.mirrorDeleteCard({
-          ...snapshot,
-          at: faDate(new Date(), this.timezone),
-        }), snapshot.cardId);
+      for (const hit of hits) {
+        const anchor = hit.fromStore ? hit.savedId : await this._anchor(hit.chatKey, hit.id, hit);
+        await this._notify(cards.mirrorDeleteNotice({ at: faDate(new Date(), this.timezone) }), anchor);
       }
       return hits;
     } catch (error) {

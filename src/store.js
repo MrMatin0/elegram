@@ -2,20 +2,24 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { log, errText } from './utils/logger.js';
 
-const SCHEMA = 3;
+const SCHEMA = 4;
 
 /**
- * Chat-keyed feature buckets. Both hold the same `{ title, since }` shape, so
- * migration, toggling and listing are written once and reused.
- *   autoSave — archive every media message of that chat
- *   mirror   — keep a live copy of every message of that chat
+ * How many `source → archived copy` pairs are kept on disk.
+ *
+ * The map exists so an edit or a delete that lands *after* a restart can still
+ * be reported as a reply to the right archived message. It is bounded because a
+ * mirrored group is an unbounded stream: the oldest pairs are dropped first.
  */
-export const BUCKETS = Object.freeze(['autoSave', 'mirror']);
+const MIRROR_MAP_LIMIT = 5000;
+
+/** The one chat-keyed feature bucket: `{ title, since }` per mirrored chat. */
+export const BUCKETS = Object.freeze(['mirror']);
 
 const defaults = () => ({
   schema: SCHEMA,
-  autoSave: {},
   mirror: {},
+  mirrorMap: {},
   stats: { archived: 0, bytes: 0, failed: 0, since: Date.now() },
 });
 
@@ -25,15 +29,16 @@ const num = (value, fallback = 0) => {
 };
 
 /**
- * Flat JSON persistence: chat subscriptions plus counters. Writes are debounced
- * (a burst of archives is one write) and atomic (write to a temp file, then
- * rename) so a crash mid-write can never truncate the real file.
+ * Flat JSON persistence: chat subscriptions, the mirror map and counters.
+ * Writes are debounced (a burst of archives is one write) and atomic (write to a
+ * temp file, then rename) so a crash mid-write can never truncate the real file.
  */
 export class Store {
-  constructor(dataDir, { debounceMs = 500 } = {}) {
+  constructor(dataDir, { debounceMs = 500, mirrorMapLimit = MIRROR_MAP_LIMIT } = {}) {
     this.dir = dataDir;
     this.file = path.join(dataDir, 'store.json');
     this.debounceMs = Math.max(0, Number(debounceMs) || 0);
+    this.mirrorMapLimit = Math.max(1, Number(mirrorMapLimit) || MIRROR_MAP_LIMIT);
     this.data = defaults();
     this._timer = null;
     this._dirty = false;
@@ -70,6 +75,16 @@ export class Store {
     return out;
   }
 
+  /** `{ "<chatKey>|<messageId>": savedMessageId }`, junk dropped. */
+  _mirrorMap(source) {
+    const out = {};
+    if (!source || typeof source !== 'object' || Array.isArray(source)) return out;
+    const entries = Object.entries(source).filter(([key, value]) => key.includes('|') && num(value) > 0);
+    // Keep the newest tail if an older file grew past the current limit.
+    for (const [key, value] of entries.slice(-this.mirrorMapLimit)) out[key] = num(value);
+    return out;
+  }
+
   _migrate(parsed) {
     const base = defaults();
     const stats = parsed.stats && typeof parsed.stats === 'object' ? parsed.stats : {};
@@ -81,9 +96,19 @@ export class Store {
         failed: num(stats.failed),
         since: num(stats.since, base.stats.since),
       },
+      mirrorMap: this._mirrorMap(parsed.mirrorMap),
     };
-    // schema <= 2 simply had no `mirror` key; an absent bucket becomes an empty one.
     for (const bucket of BUCKETS) migrated[bucket] = this._chatMap(parsed[bucket]);
+
+    // schema <= 3 had a second bucket, `autoSave`, for "archive this chat's
+    // media". `.mirror` now covers that and more, so an old auto-save
+    // subscription is carried over instead of silently dropped.
+    for (const [key, value] of Object.entries(this._chatMap(parsed.autoSave))) {
+      const existing = migrated.mirror[key];
+      migrated.mirror[key] = existing
+        ? { title: existing.title, since: Math.min(existing.since, value.since) }
+        : value;
+    }
     return migrated;
   }
 
@@ -168,22 +193,6 @@ export class Store {
     return Object.keys(this._bucket(bucket)).length;
   }
 
-  isAuto(chatKey) {
-    return this.has('autoSave', chatKey);
-  }
-
-  setAuto(chatKey, title, on) {
-    return this.toggle('autoSave', chatKey, title, on);
-  }
-
-  autoEntries() {
-    return this.entries('autoSave');
-  }
-
-  get autoCount() {
-    return this.count('autoSave');
-  }
-
   isMirror(chatKey) {
     return this.has('mirror', chatKey);
   }
@@ -200,9 +209,80 @@ export class Store {
     return this.count('mirror');
   }
 
-  /** Either feature is reason enough to keep a chat's media. */
-  isWatched(chatKey) {
-    return this.isAuto(chatKey) || this.isMirror(chatKey);
+  // --------------------------------------------------------------- mirror map
+
+  /**
+   * `source_chat_id + source_message_id → saved_message_id`.
+   *
+   * The key carries a `|`, so V8 never treats it as an array index and the
+   * object keeps insertion order — which is what makes the eviction below
+   * "oldest first" rather than "whatever comes out of the hash".
+   */
+  static mirrorKey(chatKey, messageId) {
+    const id = Number(messageId);
+    if (!chatKey || !Number.isFinite(id) || id <= 0) return '';
+    return `${chatKey}|${id}`;
+  }
+
+  _mirrorPairs() {
+    if (!this.data.mirrorMap || typeof this.data.mirrorMap !== 'object') this.data.mirrorMap = {};
+    return this.data.mirrorMap;
+  }
+
+  rememberMirror(chatKey, messageId, savedMessageId) {
+    const key = Store.mirrorKey(chatKey, messageId);
+    const saved = num(savedMessageId);
+    if (!key || saved <= 0) return false;
+    const map = this._mirrorPairs();
+    // Re-inserting has to delete first, or the pair keeps its original (old)
+    // position and gets evicted while newer, less useful pairs survive.
+    delete map[key];
+    map[key] = saved;
+    const keys = Object.keys(map);
+    for (let index = 0; index < keys.length - this.mirrorMapLimit; index += 1) delete map[keys[index]];
+    this.save();
+    return true;
+  }
+
+  savedIdFor(chatKey, messageId) {
+    const key = Store.mirrorKey(chatKey, messageId);
+    if (!key) return 0;
+    return num(this._mirrorPairs()[key]);
+  }
+
+  /**
+   * `updateDeleteMessages` carries no peer for users and basic groups, so the
+   * only thing we get is a bare message id. Message ids are unique per account
+   * in exactly those chats, which makes a scan by suffix a correct fallback.
+   * @returns {{chatKey: string, id: number, savedId: number}|null}
+   */
+  findMirrorById(messageId) {
+    const id = Number(messageId);
+    if (!Number.isFinite(id) || id <= 0) return null;
+    const suffix = `|${id}`;
+    const map = this._mirrorPairs();
+    const keys = Object.keys(map);
+    for (let index = keys.length - 1; index >= 0; index -= 1) {
+      const key = keys[index];
+      if (!key.endsWith(suffix)) continue;
+      const savedId = num(map[key]);
+      if (savedId > 0) return { chatKey: key.slice(0, -suffix.length), id, savedId };
+    }
+    return null;
+  }
+
+  forgetMirror(chatKey, messageId) {
+    const key = Store.mirrorKey(chatKey, messageId);
+    if (!key) return false;
+    const map = this._mirrorPairs();
+    if (!(key in map)) return false;
+    delete map[key];
+    this.save();
+    return true;
+  }
+
+  get mirrorMapSize() {
+    return Object.keys(this._mirrorPairs()).length;
   }
 
   // -------------------------------------------------------------------- stats

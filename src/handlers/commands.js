@@ -2,32 +2,35 @@ import * as cards from '../ui/cards.js';
 import { cmd } from '../constants.js';
 import { humanBytes } from '../utils/format.js';
 import { idStr, isSelfDestruct, mediaKind, mediaSize } from '../services/mediaInfo.js';
-import { resolveLinkedMessage } from '../services/lookup.js';
-import { isNotModified } from '../utils/retry.js';
+import { CHAT_FAILURES, resolveChat, resolveLinkedMessage } from '../services/lookup.js';
 import { log, errText } from '../utils/logger.js';
 
 // A Telegram album holds at most 10 items, so a narrow id window is enough.
 const ALBUM_SPAN = 10;
 
+/** The only two words that are a state and never a chat target. */
+const STATES = new Set(['on', 'off']);
+
 export function createCommandHandler(ctx) {
   const { client, store, queue, me, archiver, version } = ctx;
   const myId = idStr(me?.id);
 
-  // editMessage(entity, { message, text }): `message` is the *target id*, the
-  // new body goes in `text`. There is no `id` option — passing the text as
-  // `message` made the library look for a message id in a string, so every
-  // edit was rejected and every command looked dead.
-  const edit = (msg, text) =>
-    client
-      .editMessage(msg.peerId ?? msg.chatId, {
-        message: msg.id,
-        text,
-        parseMode: 'html',
-        linkPreview: false,
-      })
-      .catch((error) => {
-        if (!isNotModified(error)) log.warn('ویرایش پیام دستور ناموفق بود:', errText(error));
-      });
+  /**
+   * Every answer is written to the archive chat.
+   *
+   * Nothing is ever posted back into the source chat, and the command itself is
+   * already gone by the time this runs, so a group is left with no trace of us
+   * whatsoever — including our own queue/download/upload chatter.
+   */
+  const say = async (text) => {
+    if (!text) return null;
+    try {
+      return await archiver.sendText(text);
+    } catch (error) {
+      log.warn('نوشتن کارت وضعیت در آرشیو ناموفق بود:', errText(error));
+      return null;
+    }
+  };
 
   const peerOf = async (msg) => {
     try {
@@ -48,43 +51,6 @@ export function createCommandHandler(ctx) {
       else await client.deleteMessages(msg.peerId ?? msg.chatId, [msg.id], { revoke: true });
     } catch (error) {
       log.debug('حذف پیام دستور ناموفق بود:', errText(error));
-    }
-  };
-
-  /**
-   * True when the command already sits in the archive chat, so editing it in
-   * place leaves the card exactly where the user reads their archive.
-   *
-   * A custom STORAGE_PEER is a different chat by definition; only the default
-   * (`me` = Saved Messages) can be compared against our own id.
-   */
-  const inArchiveChat = (msg) => {
-    const chatKey = idStr(msg?.chatId);
-    if (!chatKey || !myId) return false;
-    if (archiver?.dest && archiver.dest !== 'me') return false;
-    return chatKey === myId;
-  };
-
-  /**
-   * Opens (or updates) the card for a `.save`.
-   *
-   * Inside the archive chat the command message *becomes* the card, as before.
-   * Anywhere else — groups, channels, other DMs — the command has already been
-   * deleted, so a fresh card is opened in the archive chat instead: a shared
-   * group never sees our queue/download/upload chatter.
-   *
-   * @returns the message the archiver may keep editing, or null.
-   */
-  const openCard = async (msg, text, local) => {
-    if (local) {
-      await edit(msg, text);
-      return msg;
-    }
-    try {
-      return await archiver.sendText(text);
-    } catch (error) {
-      log.warn('نوشتن کارت وضعیت در آرشیو ناموفق بود:', errText(error));
-      return null;
     }
   };
 
@@ -115,66 +81,44 @@ export function createCommandHandler(ctx) {
   }
 
   /**
-   * `.auto` and `.mirror` are the same three-state toggle over different
-   * storage, so the flow (guard the archive chat, validate on/off, refuse a
-   * no-op, persist, confirm) is written once.
+   * `.mirror [<username|chat_id>] [on|off]`
+   *
+   * Naming a target is what makes the command usable from anywhere: Saved
+   * Messages, another group, a DM. With no target it means "this chat", which is
+   * how it has always worked. The target is resolved through `getEntity`, which
+   * doubles as the authorization check — a chat this session cannot reach is
+   * reported instead of being subscribed to and silently producing nothing.
    */
-  const toggleChat = async (msg, args, spec) => {
-    const chatKey = idStr(msg.chatId);
-    // Saved Messages is the archive destination; watching it would loop.
-    if (myId && myId === chatKey) {
-      await edit(msg, cards.savedGuard(spec.name));
-      return;
-    }
-    const state = (args[0] || '').toLowerCase();
-    if (state !== 'on' && state !== 'off') {
-      await edit(msg, spec.usage());
-      return;
-    }
-    const on = state === 'on';
-    const title = chatLabel(msg, chatKey);
-    if (spec.is(chatKey) === on) {
-      await edit(msg, spec.already(title, on));
-      return;
-    }
-    spec.set(chatKey, title, on);
-    await edit(msg, on ? spec.on(title) : spec.off(title));
-  };
+  const resolveTarget = async (msg, args) => {
+    const first = String(args[0] ?? '').trim();
+    const named = Boolean(first) && !STATES.has(first.toLowerCase());
+    const state = String((named ? args[1] : args[0]) ?? '').toLowerCase();
+    if (state && !STATES.has(state)) return { usage: true };
 
-  const AUTO = {
-    name: 'auto',
-    is: (chatKey) => store.isAuto(chatKey),
-    set: (chatKey, title, on) => store.setAuto(chatKey, title, on),
-    usage: cards.autoUsage,
-    already: cards.autoAlready,
-    on: cards.autoOn,
-    off: cards.autoOff,
-  };
-
-  const MIRROR = {
-    name: 'mirror',
-    is: (chatKey) => store.isMirror(chatKey),
-    set: (chatKey, title, on) => store.setMirror(chatKey, title, on),
-    usage: cards.mirrorUsage,
-    already: cards.mirrorAlready,
-    on: cards.mirrorOn,
-    off: cards.mirrorOff,
+    const on = state !== 'off';
+    if (!named) {
+      const chatKey = idStr(msg.chatId);
+      return { on, target: { chatKey, title: chatLabel(msg, chatKey) } };
+    }
+    const found = await resolveChat(client, first);
+    if (found.failure) return { on, input: first, failure: found.failure };
+    return { on, input: first, target: found };
   };
 
   const handlers = {
     [cmd('ping')]: async (msg) => {
       const sentAt = (Number(msg.date) || 0) * 1000;
       const latency = sentAt ? Math.max(0, Date.now() - sentAt) : 0;
-      await edit(msg, cards.pingCard({ latency, uptime: Date.now() - ctx.startedAt }));
+      await say(cards.pingCard({ latency, uptime: Date.now() - ctx.startedAt }));
     },
 
-    [cmd('help')]: async (msg) => edit(msg, cards.helpCard()),
+    [cmd('help')]: async () => say(cards.helpCard()),
 
-    [cmd('status')]: async (msg) => {
+    [cmd('status')]: async () => {
       const stats = queue.stats;
       // Read through ctx: the mirror is wired up alongside this handler.
       const mirror = ctx.mirror?.stats ?? { captured: 0, edits: 0, deletions: 0 };
-      await edit(msg, cards.statusCard({
+      await say(cards.statusCard({
         uptime: Date.now() - ctx.startedAt,
         rss: process.memoryUsage().rss,
         node: process.version,
@@ -185,29 +129,50 @@ export function createCommandHandler(ctx) {
         failed: store.data.stats.failed,
         pending: stats.pending,
         running: stats.running,
-        autos: store.autoCount,
         mirrors: store.mirrorCount,
         mirrored: mirror.captured,
         mirrorEdits: mirror.edits,
         mirrorDeletes: mirror.deletions,
+        mirrorMapped: store.mirrorMapSize,
       }));
     },
 
-    [cmd('auto')]: (msg, args) => toggleChat(msg, args, AUTO),
-
-    [cmd('autolist')]: async (msg) => edit(msg, cards.autoList(store.autoEntries())),
-
     /**
-     * Live mirroring of a chat: every message is copied to the archive on
-     * arrival, and any later edit or delete is reported against that copy.
+     * Live mirroring of a chat: every message is archived as-is on arrival, and
+     * any later edit or delete is reported against that archived copy.
      */
-    [cmd('mirror')]: (msg, args) => toggleChat(msg, args, MIRROR),
+    [cmd('mirror')]: async (msg, args) => {
+      const resolved = await resolveTarget(msg, args);
+      if (resolved.usage) {
+        await say(cards.mirrorUsage());
+        return;
+      }
+      if (resolved.failure) {
+        await say(resolved.failure === CHAT_FAILURES.ACCESS
+          ? cards.chatNoAccess(resolved.input)
+          : cards.chatNotFound(resolved.input));
+        return;
+      }
 
-    [cmd('mirrorlist')]: async (msg) => edit(msg, cards.mirrorList(store.mirrorEntries())),
+      const { chatKey, title } = resolved.target;
+      // Saved Messages is the archive destination; mirroring it would loop.
+      if (!chatKey || (myId && myId === chatKey)) {
+        await say(cards.savedGuard('mirror'));
+        return;
+      }
+      if (store.isMirror(chatKey) === resolved.on) {
+        await say(cards.mirrorAlready(title, resolved.on));
+        return;
+      }
+      store.setMirror(chatKey, title, resolved.on);
+      await say(resolved.on ? cards.mirrorOn(title) : cards.mirrorOff(title));
+    },
 
-    [cmd('cancel')]: async (msg) => {
+    [cmd('mirrorlist')]: async () => say(cards.mirrorList(store.mirrorEntries())),
+
+    [cmd('cancel')]: async () => {
       const dropped = queue.clear('لغو دستی توسط کاربر');
-      await edit(msg, cards.cancelCard(dropped));
+      await say(cards.cancelCard(dropped));
     },
 
     /**
@@ -215,16 +180,8 @@ export function createCommandHandler(ctx) {
      *   `.save`        — replying to the media (works wherever we may post)
      *   `.save <link>` — the post link, for channels with forwarding disabled,
      *                    where there is nothing of ours to reply to.
-     *
-     * Outside the archive chat the command is deleted before any network work
-     * and every card is written to the archive chat, so a group is left clean.
      */
     [cmd('save')]: async (msg, args) => {
-      const local = inArchiveChat(msg);
-      // Delete first, talk later: the trace must vanish even if the save fails.
-      if (!local) await removeMessage(msg);
-      const say = (text) => openCard(msg, text, local);
-
       const argument = args.join(' ').trim();
       let anchor = null;
       let peer = null;
@@ -282,6 +239,10 @@ export function createCommandHandler(ctx) {
     const name = (parts[0] || '').toLowerCase().replace(/@[\w_]+$/, '');
     const run = handlers[name];
     if (!run) return;
+    // Delete first, talk later: a management command must never linger in the
+    // source chat while we do slow network work, and it must not survive a
+    // failure either.
+    await removeMessage(msg);
     await run(msg, parts.slice(1));
   };
 }

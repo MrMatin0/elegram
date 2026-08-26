@@ -10,9 +10,8 @@ import * as events from 'teleproto/events/index.js';
 import { COMMAND_PATTERN } from '../constants.js';
 import { Archiver } from '../services/archiver.js';
 import { TaskQueue } from '../services/queue.js';
-import { AlbumBuffer } from '../services/albums.js';
 import { MirrorService } from '../services/mirror.js';
-import { idStr, isExpiring, isSelfDestruct } from '../services/mediaInfo.js';
+import { idStr, isSelfDestruct } from '../services/mediaInfo.js';
 import { LruSet } from '../utils/lru.js';
 import { createCommandHandler } from './commands.js';
 import { log, errText } from '../utils/logger.js';
@@ -53,35 +52,6 @@ export function registerHandlers(ctx, config) {
     });
   };
 
-  const albums = new AlbumBuffer({
-    windowMs: config.albumWindowMs,
-    onFlush: (items) => {
-      items.sort((a, b) => a.id - b.id);
-      enqueue(items, items.some(isExpiring));
-    },
-  });
-
-  /** Media archiving: TTL always, plus every chat that is auto-saved or mirrored. */
-  const onIncoming = (msg, chatKey) => {
-    if (!msg?.media) return;
-    if (seen.add(`${chatKey || '?'}|${msg.id}`)) return;
-
-    // TTL media is archived unconditionally and jumps the queue: the whole
-    // point of this project is winning the race against the self-destruct timer.
-    if (isSelfDestruct(msg)) {
-      enqueue([msg], true);
-      return;
-    }
-    // A mirrored chat implies its media: a deleted photo is worth as much as a
-    // deleted sentence.
-    if (!store.isWatched(chatKey)) return;
-    if (msg.groupedId != null) {
-      albums.push(`${chatKey}|${idStr(msg.groupedId)}`, msg);
-      return;
-    }
-    enqueue([msg], isExpiring(msg));
-  };
-
   // Every callback guards itself: teleproto has no chain-level error hook and a
   // throw inside a handler must never reach the update loop.
   const handleCommand = async (event) => {
@@ -99,10 +69,19 @@ export function registerHandlers(ctx, config) {
       const chatKey = idStr(msg.chatId);
       // Saved Messages is the archive destination, never a source.
       if (myId && chatKey === myId) return;
-      // The mirror copy is sent first so the original is on the record before
-      // any (slower) media download starts.
-      if (store.isMirror(chatKey)) void mirror.capture(msg);
-      onIncoming(msg, chatKey);
+      if (seen.add(`${chatKey || '?'}|${msg.id}`)) return;
+
+      // A mirrored chat owns its whole stream: text and media alike are stored
+      // as-is by the mirror, which also keeps the id mapping edits and deletes
+      // need. Nothing else may archive the same message on top of that.
+      if (store.isMirror(chatKey)) {
+        void mirror.capture(msg);
+        return;
+      }
+      // Everywhere else, TTL media is still archived unconditionally and jumps
+      // the queue: winning the race against a self-destruct timer is the whole
+      // point of this project.
+      if (msg.media && isSelfDestruct(msg)) enqueue([msg], true);
     } catch (error) {
       log.error('خطای پردازش پیام:', errText(error));
     }
@@ -158,7 +137,6 @@ export function registerHandlers(ctx, config) {
   ctx.dispose = () => {
     for (const [callback, builder] of subscriptions) client.removeEventHandler(callback, builder);
     subscriptions.length = 0;
-    albums.dispose();
     queue.close('خاموشی سرویس');
   };
 
@@ -166,5 +144,5 @@ export function registerHandlers(ctx, config) {
   if (store.mirrorCount) {
     log.info(`آینه فعال روی ${store.mirrorCount} چت${watching ? '' : ' (بدون رهگیری ویرایش/حذف)'}`);
   }
-  return { archiver, queue, albums, mirror };
+  return { archiver, queue, mirror };
 }

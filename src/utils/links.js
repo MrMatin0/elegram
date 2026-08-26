@@ -3,11 +3,11 @@
  *
  * A channel with saving disabled (`noforwards`) almost always forbids posting
  * too, so there is no message of ours to reply to and nowhere to type a
- * command: `/save <link>` is the only way to name a target there. Everything
+ * command: `.save <link>` is the only way to name a target there. Everything
  * here is pure string work — no client, no network — so it is fully unit tested.
  */
 
-/** Why a `/save <link>` could not be turned into a message. Cards branch on these. */
+/** Why a `.save <link>` could not be turned into a message. Cards branch on these. */
 export const LINK_FAILURES = Object.freeze({
   INVALID: 'invalid',   // not a Telegram message link at all
   PEER: 'peer',         // the chat itself is out of reach
@@ -23,7 +23,8 @@ const RESERVED = new Set([
   'giftcode', 'boost', 'contact', 'nft', 'blog', 'apps', 'm',
 ]);
 
-const USERNAME = /^[a-zA-Z][a-zA-Z0-9_]{3,31}$/;
+/** A Telegram username: shared with chat-target parsing in services/lookup.js. */
+export const USERNAME = /^[a-zA-Z][a-zA-Z0-9_]{3,31}$/;
 const HAS_SCHEME = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//;
 const LINK_HINT = /^(?:tg:\/\/|(?:https?:\/\/)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog|telesco\.pe)\/)/i;
 

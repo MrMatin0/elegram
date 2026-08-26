@@ -1,10 +1,12 @@
-import { LINK_FAILURES, parseMessageLink } from '../utils/links.js';
+import { LINK_FAILURES, USERNAME, parseMessageLink } from '../utils/links.js';
 import { LruMap } from '../utils/lru.js';
 import { withRetry } from '../utils/retry.js';
+import { displayName, idStr } from './mediaInfo.js';
 import { log, errText } from '../utils/logger.js';
 
 /**
- * Turning a `/save <link>` into a real message.
+ * Turning a `.save <link>` into a real message, and a `.mirror <target>` into a
+ * chat we are actually allowed to read.
  *
  * This is the whole point of the link form: in a channel with forwarding and
  * saving disabled there is nothing of ours to reply to, so the user pastes the
@@ -14,8 +16,14 @@ import { log, errText } from '../utils/logger.js';
 const PEER_CACHE_LIMIT = 200;
 const DIALOG_SCAN_LIMIT = 500;
 
+/** Why a `.mirror <target>` could not be turned into a chat. */
+export const CHAT_FAILURES = Object.freeze({
+  INVALID: 'invalid',   // not a username and not a numeric id
+  ACCESS: 'access',     // a plausible target this session cannot reach
+});
+
 // One process talks to exactly one account, so a module-level cache is safe and
-// saves a `resolveUsername` round trip on every repeated /save of a channel.
+// saves a `resolveUsername` round trip on every repeated .save of a channel.
 const peerCache = new LruMap(PEER_CACHE_LIMIT);
 
 /**
@@ -86,6 +94,80 @@ export async function resolveLinkedMessage(client, input) {
 
   if (!message) return { failure: LINK_FAILURES.MESSAGE, parsed };
   return { message, peer, parsed };
+}
+
+// ---------------------------------------------------------------- chat targets
+
+/**
+ * The *marked* id of an entity, i.e. the form the update stream uses.
+ *
+ * `getEntity` hands back a bare id (a supergroup is `1234567890`), while
+ * `message.chatId` reports the marked one (`-1001234567890`). The store is keyed
+ * by whatever the updates produce, so an entity has to be converted before its
+ * id can be compared with — or written next to — anything else.
+ */
+export function markedChatId(entity) {
+  const id = idStr(entity?.id);
+  if (!id || id === '0') return '';
+  if (id.startsWith('-')) return id;
+  const className = String(entity?.className ?? '');
+  // Channel, ChannelForbidden — channels and supergroups share the -100 prefix.
+  if (className.startsWith('Channel')) return `-100${id}`;
+  // Chat, ChatForbidden, ChatEmpty — a basic group is only negated.
+  if (className.startsWith('Chat')) return `-${id}`;
+  return id;
+}
+
+const stripTarget = (value) =>
+  String(value ?? '')
+    .trim()
+    .replace(/^(?:https?:\/\/)?(?:www\.)?t\.me\//i, '')
+    .replace(/^@+/, '')
+    .replace(/\/+$/, '')
+    .trim();
+
+/**
+ * Turns `@channel`, `channel`, `-1001234567890` or `1234567890` into a chat we
+ * may actually operate on.
+ *
+ * Resolution goes through `getEntity`, which is also the authorization check:
+ * it only succeeds for a peer this session can see. A target we cannot resolve
+ * is reported, never guessed at — mirroring a chat we cannot read would just
+ * produce a silent, permanently empty subscription.
+ *
+ * @returns {Promise<{chatKey?: string, title?: string, entity?: object, failure?: string}>}
+ */
+export async function resolveChat(client, input) {
+  const raw = stripTarget(input);
+  if (!raw) return { failure: CHAT_FAILURES.INVALID };
+
+  const candidates = [];
+  if (/^-?\d+$/.test(raw)) {
+    const numeric = Number(raw);
+    if (!Number.isSafeInteger(numeric) || numeric === 0) return { failure: CHAT_FAILURES.INVALID };
+    candidates.push(numeric);
+    // Channel ids get copied around without the -100 Telegram marks them with.
+    if (numeric > 0) candidates.push(Number(`-100${raw}`));
+  } else if (USERNAME.test(raw)) {
+    candidates.push(raw);
+  } else {
+    return { failure: CHAT_FAILURES.INVALID };
+  }
+
+  for (const candidate of candidates) {
+    let entity = null;
+    try {
+      entity = await client.getEntity(candidate);
+    } catch (error) {
+      log.debug('[lookup] هدف قابل دسترسی نبود:', errText(error));
+      continue;
+    }
+    const chatKey = markedChatId(entity);
+    if (!chatKey) continue;
+    return { chatKey, title: displayName(entity) || String(candidate), entity };
+  }
+
+  return { failure: CHAT_FAILURES.ACCESS };
 }
 
 /** Exposed for tests and for a clean restart between sessions. */
