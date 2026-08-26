@@ -25,6 +25,21 @@ const PROGRESS_MIN_STEP = 7;
 
 const peerOf = (msg) => msg?.peerId ?? msg?.chatId;
 
+/**
+ * teleproto is not consistent about progress callbacks: `downloadMedia` reports
+ * `(received, total)` in bytes, while `sendFile` hands the upload over as a
+ * single 0..1 fraction with no second argument. Reading that fraction as a byte
+ * count against the file size pinned every upload card at 0%.
+ */
+const progressPercent = (received, total) => {
+  if (total == null) {
+    const fraction = Number(received);
+    if (!Number.isFinite(fraction) || fraction <= 0) return 0;
+    return fraction <= 1 ? percent(fraction, 1) : 0;
+  }
+  return percent(received, total);
+};
+
 let jobCounter = 0;
 const nextJobId = () => {
   jobCounter = (jobCounter + 1) % 1_000_000;
@@ -231,14 +246,17 @@ export class Archiver {
 
     const report = (stage, received, total) => {
       if (stopped || !statusMsg) return;
-      const pct = percent(received, total);
+      const pct = progressPercent(received, total);
       const now = Date.now();
+      // An edit needs a real jump AND a cooled-down timer: repeating the same
+      // percentage is a MESSAGE_NOT_MODIFIED, and editing on every callback is
+      // the fastest way into a flood wait. A stage change always gets through.
       const stageChanged = stage !== lastStage;
-      // Require BOTH a real jump and a cooled-down timer. v1's condition let an
-      // edit through every 2s even at an unchanged percentage, which meant a
-      // steady stream of MESSAGE_NOT_MODIFIED errors on slow transfers.
-      const worthEditing = stageChanged || (pct !== lastPct && now - lastAt >= PROGRESS_MIN_INTERVAL_MS && (pct - lastPct >= PROGRESS_MIN_STEP || pct === 100));
-      if (!worthEditing) return;
+      const moved = pct !== lastPct;
+      const cooledDown = now - lastAt >= PROGRESS_MIN_INTERVAL_MS;
+      const bigStep = pct - lastPct >= PROGRESS_MIN_STEP || pct === 100;
+      if (!stageChanged && !(moved && cooledDown && bigStep)) return;
+
       lastStage = stage;
       lastPct = pct;
       lastAt = now;
@@ -343,7 +361,9 @@ export class Archiver {
       parseMode: 'html',
       forceDocument: shouldForceDocument(msg),
       workers: this.uploadWorkers,
-      progressCallback: (received, total) => progress?.('upload', received, total || stat.size),
+      // Handed straight through: an absent total means teleproto is reporting a
+      // 0..1 fraction, which `progressPercent` knows how to read.
+      progressCallback: (sent, total) => progress?.('upload', sent, total),
     };
     if (attributes.length) options.attributes = attributes;
     if (msg?.document?.mimeType) options.mimeType = msg.document.mimeType;
