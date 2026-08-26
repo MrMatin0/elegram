@@ -2,11 +2,20 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { log, errText } from './utils/logger.js';
 
-const SCHEMA = 2;
+const SCHEMA = 3;
+
+/**
+ * Chat-keyed feature buckets. Both hold the same `{ title, since }` shape, so
+ * migration, toggling and listing are written once and reused.
+ *   autoSave — archive every media message of that chat
+ *   mirror   — keep a live copy of every message of that chat
+ */
+export const BUCKETS = Object.freeze(['autoSave', 'mirror']);
 
 const defaults = () => ({
   schema: SCHEMA,
   autoSave: {},
+  mirror: {},
   stats: { archived: 0, bytes: 0, failed: 0, since: Date.now() },
 });
 
@@ -16,9 +25,9 @@ const num = (value, fallback = 0) => {
 };
 
 /**
- * Flat JSON persistence: auto-save subscriptions plus counters. Writes are
- * debounced (a burst of archives is one write) and atomic (write to a temp file,
- * then rename) so a crash mid-write can never truncate the real file.
+ * Flat JSON persistence: chat subscriptions plus counters. Writes are debounced
+ * (a burst of archives is one write) and atomic (write to a temp file, then
+ * rename) so a crash mid-write can never truncate the real file.
  */
 export class Store {
   constructor(dataDir, { debounceMs = 500 } = {}) {
@@ -45,23 +54,27 @@ export class Store {
     }
   }
 
-  _migrate(parsed) {
-    const base = defaults();
-    const autoSave = {};
-    const source = parsed.autoSave && typeof parsed.autoSave === 'object' ? parsed.autoSave : {};
+  /** Normalizes one chat bucket, tolerating every shape older schemas wrote. */
+  _chatMap(source) {
+    const out = {};
+    if (!source || typeof source !== 'object' || Array.isArray(source)) return out;
     for (const [key, value] of Object.entries(source)) {
       if (!key) continue;
       if (value && typeof value === 'object') {
-        autoSave[key] = { title: String(value.title ?? key), since: num(value.since, Date.now()) };
+        out[key] = { title: String(value.title ?? key), since: num(value.since, Date.now()) };
       } else if (value) {
         // schema 1 stored a bare `true`.
-        autoSave[key] = { title: key, since: Date.now() };
+        out[key] = { title: key, since: Date.now() };
       }
     }
+    return out;
+  }
+
+  _migrate(parsed) {
+    const base = defaults();
     const stats = parsed.stats && typeof parsed.stats === 'object' ? parsed.stats : {};
-    return {
+    const migrated = {
       schema: SCHEMA,
-      autoSave,
       stats: {
         archived: num(stats.archived),
         bytes: num(stats.bytes),
@@ -69,6 +82,9 @@ export class Store {
         since: num(stats.since, base.stats.since),
       },
     };
+    // schema <= 2 simply had no `mirror` key; an absent bucket becomes an empty one.
+    for (const bucket of BUCKETS) migrated[bucket] = this._chatMap(parsed[bucket]);
+    return migrated;
   }
 
   _quarantine() {
@@ -114,34 +130,82 @@ export class Store {
     }
   }
 
-  isAuto(chatKey) {
-    return Boolean(chatKey) && Boolean(this.data.autoSave[chatKey]);
+  // ------------------------------------------------------------------ buckets
+
+  _bucket(name) {
+    if (!this.data[name] || typeof this.data[name] !== 'object') this.data[name] = {};
+    return this.data[name];
   }
 
-  setAuto(chatKey, title, on) {
+  has(bucket, chatKey) {
+    return Boolean(chatKey) && Boolean(this._bucket(bucket)[chatKey]);
+  }
+
+  /** @returns false when nothing changed (unknown key, or already in that state). */
+  toggle(bucket, chatKey, title, on) {
     if (!chatKey) return false;
+    const map = this._bucket(bucket);
     if (on) {
-      const existing = this.data.autoSave[chatKey];
-      this.data.autoSave[chatKey] = {
+      const existing = map[chatKey];
+      map[chatKey] = {
         title: String(title || chatKey),
         since: existing ? existing.since : Date.now(),
       };
-    } else if (!this.data.autoSave[chatKey]) {
+    } else if (!map[chatKey]) {
       return false;
     } else {
-      delete this.data.autoSave[chatKey];
+      delete map[chatKey];
     }
     this.save();
     return true;
   }
 
+  entries(bucket) {
+    return Object.entries(this._bucket(bucket));
+  }
+
+  count(bucket) {
+    return Object.keys(this._bucket(bucket)).length;
+  }
+
+  isAuto(chatKey) {
+    return this.has('autoSave', chatKey);
+  }
+
+  setAuto(chatKey, title, on) {
+    return this.toggle('autoSave', chatKey, title, on);
+  }
+
   autoEntries() {
-    return Object.entries(this.data.autoSave);
+    return this.entries('autoSave');
   }
 
   get autoCount() {
-    return Object.keys(this.data.autoSave).length;
+    return this.count('autoSave');
   }
+
+  isMirror(chatKey) {
+    return this.has('mirror', chatKey);
+  }
+
+  setMirror(chatKey, title, on) {
+    return this.toggle('mirror', chatKey, title, on);
+  }
+
+  mirrorEntries() {
+    return this.entries('mirror');
+  }
+
+  get mirrorCount() {
+    return this.count('mirror');
+  }
+
+  /** Either feature is reason enough to keep a chat's media. */
+  isWatched(chatKey) {
+    return this.isAuto(chatKey) || this.isMirror(chatKey);
+  }
+
+  // -------------------------------------------------------------------- stats
 
   countArchive(bytes, count = 1) {
     this.data.stats.archived += Math.max(0, Math.floor(num(count, 1)));

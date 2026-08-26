@@ -90,9 +90,20 @@ export class Archiver {
     return withRetry(async () => this.client.sendFile(await this.destPeer(), options), { label });
   }
 
-  sendText(message) {
+  /**
+   * Writes a card to the archive chat.
+   *
+   * `replyTo` is what turns the mirror into a readable thread: an edit or delete
+   * notice hangs off the original copy instead of drifting apart from it.
+   */
+  sendText(message, { replyTo = null } = {}) {
     return withRetry(
-      async () => this.client.sendMessage(await this.destPeer(), { message, parseMode: 'html', linkPreview: false }),
+      async () => this.client.sendMessage(await this.destPeer(), {
+        message,
+        parseMode: 'html',
+        linkPreview: false,
+        ...(replyTo ? { replyTo } : {}),
+      }),
       { label: 'sendMessage' },
     );
   }

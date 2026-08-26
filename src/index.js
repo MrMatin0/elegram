@@ -34,6 +34,7 @@ async function bootstrap() {
     me: null,
     queue: null,
     archiver: null,
+    mirror: null,
     version: pkg.version,
     startedAt: Date.now(),
     connected: false,
@@ -57,6 +58,10 @@ async function bootstrap() {
       bytes: store.data.stats.bytes,
       failed: store.data.stats.failed,
       autoChats: store.autoCount,
+      mirrorChats: store.mirrorCount,
+      mirrored: ctx.mirror?.stats.captured ?? 0,
+      mirrorEdits: ctx.mirror?.stats.edits ?? 0,
+      mirrorDeletes: ctx.mirror?.stats.deletions ?? 0,
       // State of the socket itself, not just of this HTTP process.
       socket: Boolean(ctx.client?.connected),
     }),
