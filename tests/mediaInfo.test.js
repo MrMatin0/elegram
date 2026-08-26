@@ -80,6 +80,11 @@ test('filenames are sanitized against traversal and control chars', () => {
   assert.equal(sanitizeFilename('a/b\\c:d*e?f"g<h>i|j'), 'a_b_c_d_e_f_g_h_i_j');
   assert.equal(sanitizeFilename('   '), 'file');
   assert.equal(sanitizeFilename('x'.repeat(300)).length, 120);
+  // The control range is what the class is for; a dash is an ordinary character
+  // and must survive, or every hyphenated file name comes out mangled.
+  assert.equal(sanitizeFilename('my-holiday-video.mp4'), 'my-holiday-video.mp4');
+  assert.equal(sanitizeFilename('bad\u0007name.txt'), 'bad_name.txt');
+  assert.equal(sanitizeFilename('tab\there.txt'), 'tab _here.txt'.replace(' _', '_'));
 });
 
 test('guessFilename prefers the declared name, then mime, then type', () => {
