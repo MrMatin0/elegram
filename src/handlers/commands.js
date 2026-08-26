@@ -1,4 +1,5 @@
 import * as cards from '../ui/cards.js';
+import { cmd } from '../constants.js';
 import { humanBytes } from '../utils/format.js';
 import { idStr, isSelfDestruct, mediaKind, mediaSize } from '../services/mediaInfo.js';
 import { resolveLinkedMessage } from '../services/lookup.js';
@@ -65,7 +66,7 @@ export function createCommandHandler(ctx) {
   };
 
   /**
-   * Opens (or updates) the card for a `/save`.
+   * Opens (or updates) the card for a `.save`.
    *
    * Inside the archive chat the command message *becomes* the card, as before.
    * Anywhere else — groups, channels, other DMs — the command has already been
@@ -113,17 +114,66 @@ export function createCommandHandler(ctx) {
     return [...found.values()].sort((a, b) => a.id - b.id);
   }
 
+  /**
+   * `.auto` and `.mirror` are the same three-state toggle over different
+   * storage, so the flow (guard the archive chat, validate on/off, refuse a
+   * no-op, persist, confirm) is written once.
+   */
+  const toggleChat = async (msg, args, spec) => {
+    const chatKey = idStr(msg.chatId);
+    // Saved Messages is the archive destination; watching it would loop.
+    if (myId && myId === chatKey) {
+      await edit(msg, cards.savedGuard(spec.name));
+      return;
+    }
+    const state = (args[0] || '').toLowerCase();
+    if (state !== 'on' && state !== 'off') {
+      await edit(msg, spec.usage());
+      return;
+    }
+    const on = state === 'on';
+    const title = chatLabel(msg, chatKey);
+    if (spec.is(chatKey) === on) {
+      await edit(msg, spec.already(title, on));
+      return;
+    }
+    spec.set(chatKey, title, on);
+    await edit(msg, on ? spec.on(title) : spec.off(title));
+  };
+
+  const AUTO = {
+    name: 'auto',
+    is: (chatKey) => store.isAuto(chatKey),
+    set: (chatKey, title, on) => store.setAuto(chatKey, title, on),
+    usage: cards.autoUsage,
+    already: cards.autoAlready,
+    on: cards.autoOn,
+    off: cards.autoOff,
+  };
+
+  const MIRROR = {
+    name: 'mirror',
+    is: (chatKey) => store.isMirror(chatKey),
+    set: (chatKey, title, on) => store.setMirror(chatKey, title, on),
+    usage: cards.mirrorUsage,
+    already: cards.mirrorAlready,
+    on: cards.mirrorOn,
+    off: cards.mirrorOff,
+  };
+
   const handlers = {
-    '/ping': async (msg) => {
+    [cmd('ping')]: async (msg) => {
       const sentAt = (Number(msg.date) || 0) * 1000;
       const latency = sentAt ? Math.max(0, Date.now() - sentAt) : 0;
       await edit(msg, cards.pingCard({ latency, uptime: Date.now() - ctx.startedAt }));
     },
 
-    '/help': async (msg) => edit(msg, cards.helpCard()),
+    [cmd('help')]: async (msg) => edit(msg, cards.helpCard()),
 
-    '/status': async (msg) => {
+    [cmd('status')]: async (msg) => {
       const stats = queue.stats;
+      // Read through ctx: the mirror is wired up alongside this handler.
+      const mirror = ctx.mirror?.stats ?? { captured: 0, edits: 0, deletions: 0 };
       await edit(msg, cards.statusCard({
         uptime: Date.now() - ctx.startedAt,
         rss: process.memoryUsage().rss,
@@ -136,49 +186,40 @@ export function createCommandHandler(ctx) {
         pending: stats.pending,
         running: stats.running,
         autos: store.autoCount,
+        mirrors: store.mirrorCount,
+        mirrored: mirror.captured,
+        mirrorEdits: mirror.edits,
+        mirrorDeletes: mirror.deletions,
       }));
     },
 
-    '/auto': async (msg, args) => {
-      const chatKey = idStr(msg.chatId);
-      // Saved Messages is the archive destination; auto-saving it would loop.
-      if (myId && myId === chatKey) {
-        await edit(msg, cards.savedGuard());
-        return;
-      }
-      const state = (args[0] || '').toLowerCase();
-      if (state !== 'on' && state !== 'off') {
-        await edit(msg, cards.autoUsage());
-        return;
-      }
-      const on = state === 'on';
-      const title = chatLabel(msg, chatKey);
-      const wasOn = store.isAuto(chatKey);
-      if (wasOn === on) {
-        await edit(msg, cards.autoAlready(title, on));
-        return;
-      }
-      store.setAuto(chatKey, title, on);
-      await edit(msg, on ? cards.autoOn(title) : cards.autoOff(title));
-    },
+    [cmd('auto')]: (msg, args) => toggleChat(msg, args, AUTO),
 
-    '/autolist': async (msg) => edit(msg, cards.autoList(store.autoEntries())),
+    [cmd('autolist')]: async (msg) => edit(msg, cards.autoList(store.autoEntries())),
 
-    '/cancel': async (msg) => {
+    /**
+     * Live mirroring of a chat: every message is copied to the archive on
+     * arrival, and any later edit or delete is reported against that copy.
+     */
+    [cmd('mirror')]: (msg, args) => toggleChat(msg, args, MIRROR),
+
+    [cmd('mirrorlist')]: async (msg) => edit(msg, cards.mirrorList(store.mirrorEntries())),
+
+    [cmd('cancel')]: async (msg) => {
       const dropped = queue.clear('لغو دستی توسط کاربر');
       await edit(msg, cards.cancelCard(dropped));
     },
 
     /**
      * Two ways to name a target:
-     *   `/save`        — replying to the media (works wherever we may post)
-     *   `/save <link>` — the post link, for channels with forwarding disabled,
+     *   `.save`        — replying to the media (works wherever we may post)
+     *   `.save <link>` — the post link, for channels with forwarding disabled,
      *                    where there is nothing of ours to reply to.
      *
      * Outside the archive chat the command is deleted before any network work
      * and every card is written to the archive chat, so a group is left clean.
      */
-    '/save': async (msg, args) => {
+    [cmd('save')]: async (msg, args) => {
       const local = inArchiveChat(msg);
       // Delete first, talk later: the trace must vanish even if the save fails.
       if (!local) await removeMessage(msg);
@@ -231,15 +272,15 @@ export function createCommandHandler(ctx) {
     },
   };
 
-  handlers['/start'] = handlers['/help'];
+  handlers[cmd('start')] = handlers[cmd('help')];
 
   return async function handle(event) {
     const msg = event.message;
     if (!msg) return;
     const parts = String(msg.message || '').trim().split(/\s+/);
-    // Strip a trailing @username so `/status@me` still routes.
-    const cmd = (parts[0] || '').toLowerCase().replace(/@[\w_]+$/, '');
-    const run = handlers[cmd];
+    // Strip a trailing @username so `.status@me` still routes.
+    const name = (parts[0] || '').toLowerCase().replace(/@[\w_]+$/, '');
+    const run = handlers[name];
     if (!run) return;
     await run(msg, parts.slice(1));
   };
