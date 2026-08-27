@@ -2,7 +2,7 @@ import * as cards from '../ui/cards.js';
 import { cmd } from '../constants.js';
 import { humanBytes } from '../utils/format.js';
 import { idStr, isSelfDestruct, mediaKind, mediaSize } from '../services/mediaInfo.js';
-import { resolveLinkedMessage } from '../services/lookup.js';
+import { resolveLinkedMessage, resolveTargetChat } from '../services/lookup.js';
 import { isNotModified } from '../utils/retry.js';
 import { log, errText } from '../utils/logger.js';
 
@@ -114,37 +114,74 @@ export function createCommandHandler(ctx) {
     return [...found.values()].sort((a, b) => a.id - b.id);
   }
 
-  /**
-   * `.auto` and `.mirror` are the same three-state toggle over different
-   * storage, so the flow (guard the archive chat, validate on/off, refuse a
-   * no-op, persist, confirm) is written once.
-   */
-  const toggleChat = async (msg, args, spec) => {
-    const chatKey = idStr(msg.chatId);
-    // Saved Messages is the archive destination; watching it would loop.
+  /** Persist + confirm, shared by both directions of a toggle. */
+  const applyToggle = async (msg, spec, on, chatKey, title, username = '') => {
     if (myId && myId === chatKey) {
       await edit(msg, cards.savedGuard(spec.name));
       return;
     }
-    const state = (args[0] || '').toLowerCase();
-    if (state !== 'on' && state !== 'off') {
-      await edit(msg, spec.usage());
-      return;
-    }
-    const on = state === 'on';
-    const title = chatLabel(msg, chatKey);
     if (spec.is(chatKey) === on) {
-      await edit(msg, spec.already(title, on));
+      await edit(msg, spec.already(title, on, chatKey));
       return;
     }
-    spec.set(chatKey, title, on);
-    await edit(msg, on ? spec.on(title) : spec.off(title));
+    spec.set(chatKey, title, on, username);
+    await edit(msg, on ? spec.on(title, chatKey) : spec.off(title, chatKey));
+  };
+
+  /** `.auto on|off` — the chat the command was sent in. */
+  const toggleHere = (msg, spec, on) => {
+    const chatKey = idStr(msg.chatId);
+    return applyToggle(msg, spec, on, chatKey, chatLabel(msg, chatKey), msg.chat?.username ?? '');
+  };
+
+  /**
+   * `.auto @channel` / `.auto off -100…` — a chat named by argument.
+   *
+   * For `off` a key already in the list outranks any lookup: a channel we were
+   * kicked from cannot be resolved anymore, and that is exactly when removing it
+   * from the list has to keep working.
+   */
+  const toggleThere = async (msg, spec, on, raw) => {
+    const found = await resolveTargetChat(client, raw, {
+      store,
+      bucket: spec.bucket,
+      preferStored: !on,
+    });
+    if (found.failure) {
+      await edit(msg, cards.targetError(spec.name, found.failure, raw));
+      return;
+    }
+    await applyToggle(msg, spec, on, found.chatKey, found.title, found.username);
+  };
+
+  /**
+   * `.auto` and `.mirror` are the same three-state toggle over different
+   * storage, so the flow (validate, refuse a no-op, persist, confirm) is written
+   * once. Three shapes are accepted:
+   *
+   *   `.mirror on` | `.mirror off`         this chat
+   *   `.mirror <target>`                   that chat — `on` is implied
+   *   `.mirror on|off <target>`            that chat, spelled out
+   *
+   * The target forms are not sugar: `.mirror on` must be typed *inside* the chat
+   * it turns on, which a broadcast channel and any read-only group forbid. Those
+   * are precisely the chats worth mirroring, so they get named from the outside.
+   */
+  const toggleChat = (msg, args, spec) => {
+    const head = (args[0] || '').toLowerCase();
+    const explicit = head === 'on' || head === 'off';
+    const target = (explicit ? args.slice(1) : args).join(' ').trim();
+    // A bare target is an opt-in: `.mirror @channel` means turn it on.
+    if (target) return toggleThere(msg, spec, explicit ? head === 'on' : true, target);
+    if (!explicit) return edit(msg, spec.usage());
+    return toggleHere(msg, spec, head === 'on');
   };
 
   const AUTO = {
     name: 'auto',
+    bucket: 'autoSave',
     is: (chatKey) => store.isAuto(chatKey),
-    set: (chatKey, title, on) => store.setAuto(chatKey, title, on),
+    set: (chatKey, title, on, username) => store.setAuto(chatKey, title, on, username),
     usage: cards.autoUsage,
     already: cards.autoAlready,
     on: cards.autoOn,
@@ -153,8 +190,9 @@ export function createCommandHandler(ctx) {
 
   const MIRROR = {
     name: 'mirror',
+    bucket: 'mirror',
     is: (chatKey) => store.isMirror(chatKey),
-    set: (chatKey, title, on) => store.setMirror(chatKey, title, on),
+    set: (chatKey, title, on, username) => store.setMirror(chatKey, title, on, username),
     usage: cards.mirrorUsage,
     already: cards.mirrorAlready,
     on: cards.mirrorOn,

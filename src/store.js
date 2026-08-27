@@ -5,8 +5,8 @@ import { log, errText } from './utils/logger.js';
 const SCHEMA = 3;
 
 /**
- * Chat-keyed feature buckets. Both hold the same `{ title, since }` shape, so
- * migration, toggling and listing are written once and reused.
+ * Chat-keyed feature buckets. Both hold the same `{ title, since, username? }`
+ * shape, so migration, toggling and listing are written once and reused.
  *   autoSave — archive every media message of that chat
  *   mirror   — keep a live copy of every message of that chat
  */
@@ -23,6 +23,8 @@ const num = (value, fallback = 0) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 };
+
+const handle = (value) => String(value ?? '').trim().replace(/^@+/, '');
 
 /**
  * Flat JSON persistence: chat subscriptions plus counters. Writes are debounced
@@ -61,7 +63,12 @@ export class Store {
     for (const [key, value] of Object.entries(source)) {
       if (!key) continue;
       if (value && typeof value === 'object') {
-        out[key] = { title: String(value.title ?? key), since: num(value.since, Date.now()) };
+        const entry = { title: String(value.title ?? key), since: num(value.since, Date.now()) };
+        // Optional and purely additive: it only lets `off @username` match an
+        // entry whose chat can no longer be resolved.
+        const username = handle(value.username);
+        if (username) entry.username = username;
+        out[key] = entry;
       } else if (value) {
         // schema 1 stored a bare `true`.
         out[key] = { title: key, since: Date.now() };
@@ -141,15 +148,22 @@ export class Store {
     return Boolean(chatKey) && Boolean(this._bucket(bucket)[chatKey]);
   }
 
-  /** @returns false when nothing changed (unknown key, or already in that state). */
-  toggle(bucket, chatKey, title, on) {
+  /**
+   * `username` is optional metadata: it is what makes `off @channel` work after
+   * the chat itself became unreachable. An existing one is never lost.
+   *
+   * @returns false when nothing changed (unknown key, or already in that state).
+   */
+  toggle(bucket, chatKey, title, on, username = '') {
     if (!chatKey) return false;
     const map = this._bucket(bucket);
     if (on) {
       const existing = map[chatKey];
+      const name = handle(username) || handle(existing?.username);
       map[chatKey] = {
         title: String(title || chatKey),
         since: existing ? existing.since : Date.now(),
+        ...(name ? { username: name } : {}),
       };
     } else if (!map[chatKey]) {
       return false;
@@ -172,8 +186,8 @@ export class Store {
     return this.has('autoSave', chatKey);
   }
 
-  setAuto(chatKey, title, on) {
-    return this.toggle('autoSave', chatKey, title, on);
+  setAuto(chatKey, title, on, username = '') {
+    return this.toggle('autoSave', chatKey, title, on, username);
   }
 
   autoEntries() {
@@ -188,8 +202,8 @@ export class Store {
     return this.has('mirror', chatKey);
   }
 
-  setMirror(chatKey, title, on) {
-    return this.toggle('mirror', chatKey, title, on);
+  setMirror(chatKey, title, on, username = '') {
+    return this.toggle('mirror', chatKey, title, on, username);
   }
 
   mirrorEntries() {
