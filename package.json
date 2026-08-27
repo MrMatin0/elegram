@@ -8,8 +8,7 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "login": "node src/login.js",
-    "test": "node --test"
+    "login": "node src/login.js"
   },
   "engines": {
     "node": ">=20"
