@@ -1,5 +1,6 @@
 import { COMMAND_PREFIX, cmd } from '../constants.js';
 import { LINK_FAILURES } from '../utils/links.js';
+import { TARGET_FAILURES } from '../utils/targets.js';
 import { humanBytes, humanDuration, progressBar, esc, truncate } from '../utils/format.js';
 
 export const LINE = '\u2501'.repeat(18);
@@ -29,6 +30,9 @@ const body = (text, limit = BODY_LIMIT) => {
   return value ? `<code>${esc(truncate(value, limit))}</code>` : EMPTY_BODY;
 };
 
+/** The exact key, so the user can copy it straight into the `off` form. */
+const idRow = (chatKey) => (chatKey ? `\u{1F194} شناسه: <code>${esc(chatKey)}</code>` : '');
+
 export const helpCard = () => block([
   `${BRAND} — دستیار آرشیو تلگرام`,
   LINE,
@@ -38,11 +42,19 @@ export const helpCard = () => block([
   `\u25AA\uFE0F ${chip('auto on')} | ${chip('auto off')} — سیو خودکار رسانه‌های همین چت`,
   `\u25AA\uFE0F ${chip('autolist')} — چت‌های دارای سیو خودکار`,
   `\u25AA\uFE0F ${chip('mirror on')} | ${chip('mirror off')} — آینه لحظه‌ای همین چت`,
+  `\u25AA\uFE0F ${chip('mirror')} <code>@username</code> — آینه یک کانال/گروه <b>از هر جا</b>`,
+  `\u25AA\uFE0F ${chip('mirror off')} <code>@username</code> — حذفش از لیست آینه`,
   `\u25AA\uFE0F ${chip('mirrorlist')} — چت‌های آینه‌شده`,
   `\u25AA\uFE0F ${chip('status')} — آمار و وضعیت سیستم`,
   `\u25AA\uFE0F ${chip('cancel')} — پاک کردن صف انتظار`,
   `\u25AA\uFE0F ${chip('ping')} — بررسی اتصال و آپ‌تایم`,
   `\u25AA\uFE0F ${chip('help')} — همین راهنما`,
+  LINE,
+  '<b>\u{1F4E1} کانال و گروهی که نمی‌شه توش نوشت</b>',
+  `\u25AB\uFE0F یوزرنیم یا شناسه عددی را جلوی دستور بگذار: <code>${cmd('mirror')} @channel</code>`,
+  `\u25AB\uFE0F شناسه خصوصی هم قبول است: <code>${cmd('mirror')} -1001234567890</code>`,
+  `\u25AB\uFE0F ${chip('auto')} هم دقیقاً همین شکل را می‌پذیرد.`,
+  '\u25AB\uFE0F این دستورها را از داخل Saved Messages خودت بفرست.',
   LINE,
   '<b>\u{1FA9E} آینه چطور کار می‌کند؟</b>',
   '\u25AB\uFE0F هر پیام آن چت، همان لحظه در آرشیو کپی می‌شود.',
@@ -91,31 +103,34 @@ export const statusCard = (s) => block([
   `\u25AB\uFE0F ویرایش: <b>${s.mirrorEdits ?? 0}</b> \u2022 حذف: <b>${s.mirrorDeletes ?? 0}</b>`,
 ]);
 
-// ------------------------------------------------------------------ auto-save
+// ---------------------------------------------------------------- chat toggles
 
-export const autoOn = (title) => block([
-  '\u{1F514} <b>سیو خودکار فعال شد</b>',
-  LINE,
-  `\u{1F4AC} چت: <b>${esc(title)}</b>`,
-  '\u25AB\uFE0F از این پس تمام رسانه‌های این چت به‌صورت خودکار آرشیو می‌شوند.',
-]);
-
-export const autoOff = (title) => block([
-  '\u{1F515} <b>سیو خودکار غیرفعال شد</b>',
-  LINE,
-  `\u{1F4AC} چت: <b>${esc(title)}</b>`,
-]);
-
-export const autoAlready = (title, on) => block([
-  on ? '\u2139\uFE0F سیو خودکار این چت از قبل روشن بود.' : '\u2139\uFE0F سیو خودکار این چت از قبل خاموش بود.',
-  '',
-  `\u{1F4AC} چت: <b>${esc(title)}</b>`,
-]);
+/**
+ * Every shape of a chat toggle, written once. `name` is `auto` or `mirror`.
+ *
+ * The target forms exist because the in-chat form cannot work everywhere: a
+ * broadcast channel (and a read-only group) gives you nowhere to type.
+ */
+const toggleUsage = (name) => [
+  `\u25AA\uFE0F داخل خود چت: ${chip(`${name} on`)} یا ${chip(`${name} off`)}`,
+  '\u25AA\uFE0F از هر جا، با یوزرنیم یا شناسه عددی:',
+  `<code>${cmd(name)} @username</code>`,
+  `<code>${cmd(name)} -1001234567890</code>`,
+  '\u25AA\uFE0F برای حذف از لیست:',
+  `<code>${cmd(name)} off @username</code>`,
+  `<code>${cmd(name)} off -1001234567890</code>`,
+];
 
 export const autoUsage = () => compact([
   '\u26A0\uFE0F استفاده صحیح:',
   '',
-  `${chip('auto on')} یا ${chip('auto off')}`,
+  ...toggleUsage('auto'),
+]);
+
+export const mirrorUsage = () => compact([
+  '\u26A0\uFE0F استفاده صحیح:',
+  '',
+  ...toggleUsage('mirror'),
 ]);
 
 /** `name` is the command the user just tried to run inside Saved Messages. */
@@ -123,6 +138,52 @@ export const savedGuard = (name = 'auto') => compact([
   '\u2139\uFE0F اینجا <b>Saved Messages</b> خودت است!',
   '',
   `برای فعال‌سازی، داخل چت موردنظر دستور ${chip(`${name} on`)} را بفرست.`,
+  `اگر آن چت اجازه نوشتن نمی‌دهد، از همین‌جا: <code>${cmd(name)} @username</code>`,
+]);
+
+/** A username/id we could not turn into a chat. `name` is `auto` or `mirror`. */
+export const targetError = (name, reason, raw = '') => {
+  const echo = raw ? `\u{1F50E} ورودی: <code>${esc(truncate(String(raw), 80))}</code>` : '';
+  if (reason === TARGET_FAILURES.PEER) {
+    return compact([
+      '\u{1F6A7} <b>این چت را پیدا نکردم.</b>',
+      echo,
+      '',
+      'اگر خصوصی است، باید با همین اکانت عضوش باشی و یک بار در تلگرام بازش کنی.',
+      '\u{1F4A1} شناسه عددی را کامل بده (با <code>-100</code>) یا از یوزرنیم استفاده کن:',
+      `<code>${cmd(name)} -1001234567890</code>`,
+    ]);
+  }
+  return compact([
+    '\u{1F914} <b>این یوزرنیم یا شناسه معتبر نیست.</b>',
+    echo,
+    '',
+    ...toggleUsage(name),
+  ]);
+};
+
+// ------------------------------------------------------------------ auto-save
+
+export const autoOn = (title, chatKey = '') => compact([
+  '\u{1F514} <b>سیو خودکار فعال شد</b>',
+  LINE,
+  `\u{1F4AC} چت: <b>${esc(title)}</b>`,
+  idRow(chatKey),
+  '\u25AB\uFE0F از این پس تمام رسانه‌های این چت به‌صورت خودکار آرشیو می‌شوند.',
+]);
+
+export const autoOff = (title, chatKey = '') => compact([
+  '\u{1F515} <b>سیو خودکار غیرفعال شد</b>',
+  LINE,
+  `\u{1F4AC} چت: <b>${esc(title)}</b>`,
+  idRow(chatKey),
+]);
+
+export const autoAlready = (title, on, chatKey = '') => compact([
+  on ? '\u2139\uFE0F سیو خودکار این چت از قبل روشن بود.' : '\u2139\uFE0F سیو خودکار این چت از قبل خاموش بود.',
+  '',
+  `\u{1F4AC} چت: <b>${esc(title)}</b>`,
+  idRow(chatKey),
 ]);
 
 export const autoList = (entries) => {
@@ -131,28 +192,44 @@ export const autoList = (entries) => {
     return compact([
       '\u{1F4ED} هیچ چتی دارای سیو خودکار نیست.',
       '',
-      `\u{1F4A1} داخل چت موردنظر دستور ${chip('auto on')} را بفرست.`,
+      `\u{1F4A1} داخل چت موردنظر ${chip('auto on')} را بفرست، یا از هر جا: <code>${cmd('auto')} @username</code>`,
     ]);
   }
-  return block([`\u{1F501} <b>چت‌های دارای سیو خودکار (${list.length})</b>`, LINE, chatRows(list)]);
+  return block([
+    `\u{1F501} <b>چت‌های دارای سیو خودکار (${list.length})</b>`,
+    LINE,
+    chatRows(list),
+    SOFT,
+    `\u{1F4A1} حذف: <code>${cmd('auto')} off &lt;شناسه&gt;</code>`,
+  ]);
 };
 
-/** Shared numbered list of `[chatKey, { title, since }]` pairs. */
+/**
+ * Shared numbered list of `[chatKey, { title, since }]` pairs.
+ *
+ * The key is printed on purpose: it is the argument the `off` form takes, and
+ * for a channel you cannot post in it is the only handle you have.
+ */
 function chatRows(list) {
   return list
     .map(([key, value], index) => {
       const since = Number(value?.since) || Date.now();
-      return `${index + 1}. <b>${esc(value?.title || key)}</b>\n    \u2514 از ${humanDuration(Date.now() - since)} پیش`;
+      return [
+        `${index + 1}. <b>${esc(value?.title || key)}</b>`,
+        `    \u251C <code>${esc(key)}</code>${value?.username ? ` \u2022 @${esc(value.username)}` : ''}`,
+        `    \u2514 از ${humanDuration(Date.now() - since)} پیش`,
+      ].join('\n');
     })
     .join('\n');
 }
 
 // --------------------------------------------------------------------- mirror
 
-export const mirrorOn = (title) => block([
+export const mirrorOn = (title, chatKey = '') => compact([
   '\u{1FA9E} <b>آینه روشن شد</b>',
   LINE,
   `\u{1F4AC} چت: <b>${esc(title)}</b>`,
+  idRow(chatKey),
   SOFT,
   '\u25AB\uFE0F هر پیام جدید همان لحظه در آرشیو کپی می‌شود.',
   '\u25AB\uFE0F ویرایش شد \u2192 نسخه قبلی و جدید کنار هم ثبت می‌شوند.',
@@ -160,23 +237,19 @@ export const mirrorOn = (title) => block([
   '\u25AB\uFE0F رسانه‌های این چت هم خودکار آرشیو می‌شوند.',
 ]);
 
-export const mirrorOff = (title) => block([
+export const mirrorOff = (title, chatKey = '') => compact([
   '\u{1F6D1} <b>آینه خاموش شد</b>',
   LINE,
   `\u{1F4AC} چت: <b>${esc(title)}</b>`,
+  idRow(chatKey),
   '\u25AB\uFE0F هر چه تا الآن ثبت شده، سر جایش در آرشیو می‌ماند.',
 ]);
 
-export const mirrorAlready = (title, on) => block([
+export const mirrorAlready = (title, on, chatKey = '') => compact([
   on ? '\u2139\uFE0F آینه این چت از قبل روشن بود.' : '\u2139\uFE0F آینه این چت از قبل خاموش بود.',
   '',
   `\u{1F4AC} چت: <b>${esc(title)}</b>`,
-]);
-
-export const mirrorUsage = () => compact([
-  '\u26A0\uFE0F استفاده صحیح:',
-  '',
-  `${chip('mirror on')} یا ${chip('mirror off')}`,
+  idRow(chatKey),
 ]);
 
 export const mirrorList = (entries) => {
@@ -185,10 +258,16 @@ export const mirrorList = (entries) => {
     return compact([
       '\u{1F4ED} هیچ چتی آینه نشده.',
       '',
-      `\u{1F4A1} داخل چت موردنظر دستور ${chip('mirror on')} را بفرست.`,
+      `\u{1F4A1} داخل چت موردنظر ${chip('mirror on')} را بفرست، یا از هر جا: <code>${cmd('mirror')} @username</code>`,
     ]);
   }
-  return block([`\u{1FA9E} <b>چت‌های آینه‌شده (${list.length})</b>`, LINE, chatRows(list)]);
+  return block([
+    `\u{1FA9E} <b>چت‌های آینه‌شده (${list.length})</b>`,
+    LINE,
+    chatRows(list),
+    SOFT,
+    `\u{1F4A1} حذف: <code>${cmd('mirror')} off &lt;شناسه&gt;</code>`,
+  ]);
 };
 
 /** The live copy, written the moment a message lands. */
