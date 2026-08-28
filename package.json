@@ -1,7 +1,7 @@
 {
   "name": "elegram",
-  "version": "2.3.0",
-  "description": "Telegram self-bot for automatic media archiving — protected content, TTL media, albums, auto-save, live message mirroring, glass control panel",
+  "version": "2.4.0",
+  "description": "Telegram self-bot for automatic media archiving — protected content, TTL media, albums, auto-save, live message mirroring, first comment on channel posts, glass control panel",
   "type": "module",
   "main": "src/index.js",
   "license": "MIT",
