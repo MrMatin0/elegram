@@ -29,6 +29,7 @@ export const SCREEN = Object.freeze({
   HOME: 'h',
   AUTO: 'a',
   MIRROR: 'm',
+  COMMENT: 'f',
   CHAT: 'c',
   QUEUE: 'q',
   STATS: 's',
