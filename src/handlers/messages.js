@@ -12,6 +12,7 @@ import { Archiver } from '../services/archiver.js';
 import { TaskQueue } from '../services/queue.js';
 import { AlbumBuffer } from '../services/albums.js';
 import { MirrorService } from '../services/mirror.js';
+import { FirstCommentService } from '../services/comment.js';
 import { idStr, isExpiring, isSelfDestruct } from '../services/mediaInfo.js';
 import { LruSet } from '../utils/lru.js';
 import { createCommandHandler } from './commands.js';
@@ -33,9 +34,17 @@ export function registerHandlers(ctx, config) {
     timezone: config.timezone,
     myId,
   });
+  const firstComment = new FirstCommentService(client, store, archiver, {
+    delayMs: config.firstCommentDelayMs,
+    attempts: config.firstCommentAttempts,
+    join: config.firstCommentJoin,
+    timezone: config.timezone,
+    myId,
+  });
   ctx.archiver = archiver;
   ctx.queue = queue;
   ctx.mirror = mirror;
+  ctx.firstComment = firstComment;
 
   const onCommand = createCommandHandler(ctx);
 
@@ -82,6 +91,19 @@ export function registerHandlers(ctx, config) {
     enqueue([msg], isExpiring(msg));
   };
 
+  /**
+   * A candidate for the first comment. The service does every check itself
+   * (configured channel? a real post? not one of our own commands? already
+   * commented on?), so both directions can hand it everything they see.
+   */
+  const onPost = (msg) => {
+    try {
+      void firstComment.onPost(msg);
+    } catch (error) {
+      log.error('خطای پردازش کامنت اول:', errText(error));
+    }
+  };
+
   // Every callback guards itself: teleproto has no chain-level error hook and a
   // throw inside a handler must never reach the update loop.
   const handleCommand = async (event) => {
@@ -102,9 +124,27 @@ export function registerHandlers(ctx, config) {
       // The mirror copy is sent first so the original is on the record before
       // any (slower) media download starts.
       if (store.isMirror(chatKey)) void mirror.capture(msg);
+      onPost(msg);
       onIncoming(msg, chatKey);
     } catch (error) {
       log.error('خطای پردازش پیام:', errText(error));
+    }
+  };
+
+  /**
+   * Our own messages, for the sake of one feature only.
+   *
+   * A post *you* publish in *your own* channel arrives with `out: true`, so the
+   * incoming builder above never sees it — and a channel you run is exactly the
+   * one you want the first comment on. Nothing else reads this stream.
+   */
+  const handleOutgoing = (event) => {
+    try {
+      const msg = event.message;
+      if (!msg || msg.service) return;
+      onPost(msg);
+    } catch (error) {
+      log.error('خطای پردازش پست خودی:', errText(error));
     }
   };
 
@@ -147,6 +187,7 @@ export function registerHandlers(ctx, config) {
   // before we ever see them instead of re-checking `out` by hand.
   subscribe('NewMessage(commands)', events.NewMessage, { outgoing: true, pattern: COMMAND_PATTERN }, handleCommand);
   subscribe('NewMessage(incoming)', events.NewMessage, { incoming: true }, handleIncoming);
+  subscribe('NewMessage(outgoing)', events.NewMessage, { outgoing: true }, handleOutgoing);
 
   // Both subscriptions are attempted, always. Chaining them with `&&` meant a
   // build missing only `EditedMessage` never even tried to register the delete
@@ -162,9 +203,12 @@ export function registerHandlers(ctx, config) {
     queue.close('خاموشی سرویس');
   };
 
-  log.ok('هندلرها فعال شدند — منتظر پیام‌ها…');
+  log.ok('هندلرها فعال شدند — منتطر پیام‌ها…');
   if (store.mirrorCount) {
     log.info(`آینه فعال روی ${store.mirrorCount} چت${watching ? '' : ' (بدون رهگیری ویرایش/حذف)'}`);
   }
-  return { archiver, queue, albums, mirror };
+  if (store.firstCommentCount) {
+    log.info(`کامنت اول فعال روی ${store.firstCommentCount} کانال${firstComment.available ? '' : ' (غیرفعال: سازنده‌های TL در دسترس نیست)'}`);
+  }
+  return { archiver, queue, albums, mirror, firstComment };
 }

@@ -1,6 +1,7 @@
 import * as cards from '../ui/cards.js';
 import { cmd } from '../constants.js';
 import { humanBytes } from '../utils/format.js';
+import { parseCommentInput } from '../utils/comment.js';
 import { idStr, isSelfDestruct, mediaKind, mediaSize } from '../services/mediaInfo.js';
 import { resolveLinkedMessage, resolveTargetChat } from '../services/lookup.js';
 import { collectAlbum } from '../services/save.js';
@@ -171,6 +172,54 @@ export function createCommandHandler(ctx) {
     off: cards.mirrorOff,
   };
 
+  /**
+   * `.comment` — the first comment under every new post of a channel.
+   *
+   * Deliberately *not* routed through `toggleChat`: this toggle carries a payload
+   * (the text to post) and it has no in-chat form. `.comment on` typed inside the
+   * channel would be a channel post itself — the service would then have to
+   * decide whether to comment on the command that switched it on. Naming the
+   * channel from the outside removes the question entirely.
+   */
+  const setComment = async (msg, raw) => {
+    const { direction, target, text } = parseCommentInput(raw);
+    if (!target) {
+      await edit(msg, cards.commentUsage());
+      return;
+    }
+    const off = direction === 'off';
+    const found = await resolveTargetChat(client, target, {
+      store,
+      bucket: 'firstComment',
+      preferStored: off,
+    });
+    if (found.failure) {
+      await edit(msg, cards.targetError('comment', found.failure, target));
+      return;
+    }
+
+    if (off) {
+      if (!store.isFirstComment(found.chatKey)) {
+        await edit(msg, cards.commentAlready(found.title, false, found.chatKey));
+        return;
+      }
+      store.setFirstComment(found.chatKey, found.title, false);
+      await edit(msg, cards.commentOff(found.title, found.chatKey));
+      return;
+    }
+
+    // No new text re-uses the stored one, so `.comment @channel` is a re-enable
+    // and never a way to lose a message that was typed once.
+    const existing = store.firstCommentEntry(found.chatKey);
+    const body = text || String(existing?.text ?? '');
+    if (!body) {
+      await edit(msg, cards.commentNoText(found.title, found.chatKey));
+      return;
+    }
+    store.setFirstComment(found.chatKey, found.title, true, found.username, body);
+    await edit(msg, cards.commentOn(found.title, found.chatKey, body, Boolean(existing)));
+  };
+
   /** The panel lives on the companion bot, so its link is built from `ctx`. */
   const panelLink = () => (ctx.panel?.username ? `https://t.me/${ctx.panel.username}?start=panel` : '');
 
@@ -210,6 +259,7 @@ export function createCommandHandler(ctx) {
       const stats = queue.stats;
       // Read through ctx: the mirror is wired up alongside this handler.
       const mirror = ctx.mirror?.stats ?? { captured: 0, edits: 0, deletions: 0 };
+      const comment = ctx.firstComment?.stats ?? { posted: 0, failed: 0, skipped: 0 };
       await edit(msg, cards.statusCard({
         uptime: Date.now() - ctx.startedAt,
         rss: process.memoryUsage().rss,
@@ -226,6 +276,9 @@ export function createCommandHandler(ctx) {
         mirrored: mirror.captured,
         mirrorEdits: mirror.edits,
         mirrorDeletes: mirror.deletions,
+        comments: store.firstCommentCount,
+        commented: comment.posted,
+        commentFails: comment.failed,
         panel: Boolean(ctx.panel?.ready),
         panelLink: panelLink(),
       }));
@@ -242,6 +295,14 @@ export function createCommandHandler(ctx) {
     [cmd('mirror')]: (msg, args) => toggleChat(msg, args, MIRROR),
 
     [cmd('mirrorlist')]: async (msg) => edit(msg, cards.mirrorList(store.mirrorEntries())),
+
+    /**
+     * `.comment @channel | متن` — be the first comment under every new post of
+     * that channel, in its linked discussion group.
+     */
+    [cmd('comment')]: (msg, args) => setComment(msg, args.join(' ')),
+
+    [cmd('commentlist')]: async (msg) => edit(msg, cards.commentList(store.firstCommentEntries())),
 
     [cmd('cancel')]: async (msg) => {
       const dropped = queue.clear('لغو دستی توسط کاربر');
@@ -311,6 +372,9 @@ export function createCommandHandler(ctx) {
   };
 
   handlers[cmd('start')] = handlers[cmd('help')];
+  // Short aliases, because this one gets typed a lot.
+  handlers[cmd('fc')] = handlers[cmd('comment')];
+  handlers[cmd('fclist')] = handlers[cmd('commentlist')];
 
   return async function handle(event) {
     const msg = event.message;

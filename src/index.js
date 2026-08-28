@@ -36,6 +36,7 @@ async function bootstrap() {
     queue: null,
     archiver: null,
     mirror: null,
+    firstComment: null,
     panel: null,
     // Told apart from `panel` on purpose: the `.panel` card has to explain a
     // token that was never set differently from one Telegram rejected.
@@ -78,6 +79,9 @@ async function bootstrap() {
       mirrored: ctx.mirror?.stats.captured ?? 0,
       mirrorEdits: ctx.mirror?.stats.edits ?? 0,
       mirrorDeletes: ctx.mirror?.stats.deletions ?? 0,
+      commentChats: store.firstCommentCount,
+      comments: store.data.stats.comments ?? 0,
+      commentFails: ctx.firstComment?.stats.failed ?? 0,
       // The panel is optional, so `false` here is a configuration fact, not an
       // outage: a probe should never restart us over a missing BOT_TOKEN.
       panel: Boolean(ctx.panel?.ready),
@@ -131,7 +135,7 @@ async function bootstrap() {
   // A process that keeps running after an uncaught exception is a process in an
   // unknown state. Log it, flush the store, and let the supervisor restart us.
   process.on('uncaughtException', (error) => {
-    log.error('خطای غیرمنتظره:', errText(error));
+    log.error('خطای غیرمنتطره:', errText(error));
     void shutdown('UNCAUGHT_EXCEPTION', 1);
   });
 }
