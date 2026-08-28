@@ -18,7 +18,7 @@ import { cmd } from '../constants.js';
 import { esc, humanBytes, humanDuration, truncate } from '../utils/format.js';
 import {
   BRAND, BULLET, ICON, MID,
-  code, compact, header, hint, kv, kvRaw, meter, pill, ratio, section, stack, toast, tree,
+  code, compact, header, hint, kv, kvRaw, meter, pill, quote, ratio, section, stack, toast, tree,
 } from './theme.js';
 import {
   ACTION, SCREEN,
@@ -54,6 +54,7 @@ export function home(view) {
   const { system = {}, archive = {}, queue = {}, mirrorStats = {} } = view;
   const autos = entriesOf(view, SCREEN.AUTO).length;
   const mirrors = entriesOf(view, SCREEN.MIRROR).length;
+  const comments = (view.comment ?? []).length;
 
   const text = stack([
     header(ICON.panel, BRAND, 'پنل کنترل'),
@@ -74,7 +75,7 @@ export function home(view) {
       section(ICON.queue, 'صف'),
       tree([
         kvRaw('بار کارگرها', ratio(queue.running, queue.concurrency, 10)),
-        kv('در انتظار', String(queue.pending ?? 0)),
+        kv('در انتطار', String(queue.pending ?? 0)),
         kv('در حال پردازش', String(queue.running ?? 0)),
       ]),
     ]),
@@ -84,6 +85,7 @@ export function home(view) {
         kv('سیو خودکار', `${autos} چت`),
         kv('آینه', `${mirrors} چت`),
         kv('پیام‌های آینه‌شده', String(mirrorStats.captured ?? 0)),
+        kv('کامنت اول', `${comments} کانال`),
       ]),
     ]),
     hint('هر دکمه یک صفحه است؛ هیچ چیزی بدون تأیید حذف نمی‌شود.'),
@@ -97,18 +99,18 @@ export function home(view) {
         btn(`${ICON.mirror} آینه (${mirrors})`, [SCREEN.MIRROR, ACTION.OPEN]),
       ),
       row(
+        btn(`${ICON.comment} کامنت اول (${comments})`, [SCREEN.COMMENT, ACTION.OPEN]),
         btn(`${ICON.queue} صف (${queue.pending ?? 0})`, [SCREEN.QUEUE, ACTION.OPEN]),
+      ),
+      row(
         btn(`${ICON.stats} آمار`, [SCREEN.STATS, ACTION.OPEN]),
-      ),
-      row(
         btn(`${ICON.tools} ابزارها`, [SCREEN.TOOLS, ACTION.OPEN]),
-        btn(`${ICON.settings} تنظیمات`, [SCREEN.SETTINGS, ACTION.OPEN]),
       ),
       row(
+        btn(`${ICON.settings} تنطیمات`, [SCREEN.SETTINGS, ACTION.OPEN]),
         btn(`${ICON.help} راهنما`, [SCREEN.HELP, ACTION.OPEN]),
-        refreshBtn([SCREEN.HOME, ACTION.REFRESH]),
       ),
-      row(closeBtn()),
+      row(refreshBtn([SCREEN.HOME, ACTION.REFRESH]), closeBtn()),
     ),
   };
 }
@@ -161,6 +163,75 @@ export function chats(view, screen) {
   };
 }
 
+// --------------------------------------------------------------- first comment
+
+/**
+ * The first-comment list.
+ *
+ * Its own screen rather than a third bucket in `chats()`: every row carries a
+ * *body*, which is the whole point of the feature and the one thing the other
+ * two lists never have to show. Adding and editing are the same prompt — a
+ * channel that is already in the list simply gets its text replaced.
+ */
+export function comments(view) {
+  const list = view.comment ?? [];
+  const stats = view.commentStats ?? {};
+  const { slice, page, pages, start, total } = paginate(list, view.page, PAGE_SIZE);
+  const dropping = view.confirm?.kind === 'comment' ? view.confirm.key : '';
+
+  const body = total
+    ? slice
+      .map(([key, entry], index) => compact([
+        `${start + index + 1}. <b>${esc(entry?.title || key)}</b>`,
+        tree([
+          kvRaw('شناسه', code(key)),
+          entry?.username ? kvRaw('یوزرنیم', code(`@${entry.username}`)) : '',
+          kv('کامنت گذاشته', entry?.sent ? `${entry.sent} بار` : 'هنوز هیچ'),
+        ]),
+        quote(entry?.text, 160),
+      ]))
+      .join('\n')
+    : compact([
+      toast(ICON.empty, 'هنوز کانالی کامنت اول ندارد.'),
+      hint(`با دکمه «افزودن کانال»، یا از اکانت خودت: ${code(`${cmd('comment')} @channel | متن`)}`),
+    ]);
+
+  const text = stack([
+    header(ICON.comment, '<b>کامنت اول</b>', total ? `${total} کانال` : 'خالی'),
+    noticeLine(view.notice),
+    body,
+    total
+      ? tree([
+        kv('گذاشته‌شده', String(stats.posted ?? 0)),
+        stats.failed ? kv('ناموفق', String(stats.failed)) : '',
+      ])
+      : '',
+    dropping
+      ? toast(ICON.warn, 'کامنت اول این کانال خاموش شود؟')
+      : hint('برای عوض کردن متن، همان کانال را با متن تازه دوباره اضافه کن.'),
+  ]);
+
+  const keys = dropping
+    ? keyboard(
+      confirmRow('بله، خاموش کن', [SCREEN.COMMENT, ACTION.CONFIRM, dropping], [SCREEN.COMMENT, ACTION.OPEN]),
+      row(backBtn()),
+    )
+    : keyboard(
+      ...grid(
+        slice.map(([key, entry]) => btn(`${ICON.trash} ${label(entry?.title || key)}`, [SCREEN.COMMENT, ACTION.DROP, key])),
+        1,
+      ).map((line) => line),
+      pager(SCREEN.COMMENT, page, pages),
+      row(
+        btn(`\u2795 افزودن کانال`, [SCREEN.COMMENT, ACTION.PROMPT]),
+        refreshBtn([SCREEN.COMMENT, ACTION.REFRESH]),
+      ),
+      row(backBtn()),
+    );
+
+  return { text, keyboard: keys };
+}
+
 // ------------------------------------------------------------------ chat detail
 
 export function chat(view) {
@@ -176,7 +247,7 @@ export function chat(view) {
   }
 
   const from = view.from ?? SCREEN.AUTO;
-  const { key, entry, auto, mirror } = target;
+  const { key, entry, auto, mirror, comment } = target;
 
   const text = stack([
     header(ICON.chat, `<b>${esc(entry?.title || key)}</b>`),
@@ -191,10 +262,11 @@ export function chat(view) {
       tree([
         kvRaw('سیو خودکار', pill(auto)),
         kvRaw('آینه', pill(mirror)),
+        kvRaw('کامنت اول', pill(Boolean(comment))),
       ]),
     ]),
     view.confirm?.kind === 'drop'
-      ? toast(ICON.warn, 'حذف از هر دو لیست؟ آرشیو موجود دست‌نخورده می‌ماند.')
+      ? toast(ICON.warn, 'حذف از همه‌ی لیست‌ها؟ آرشیو موجود دست‌نخورده می‌ماند.')
       : hint('آینه، رسانه‌های همان چت را هم خودکار آرشیو می‌کند.'),
   ]);
 
@@ -208,6 +280,7 @@ export function chat(view) {
         toggleBtn('سیو خودکار', auto, [SCREEN.CHAT, ACTION.TOGGLE, SCREEN.AUTO, key]),
         toggleBtn('آینه', mirror, [SCREEN.CHAT, ACTION.TOGGLE, SCREEN.MIRROR, key]),
       ),
+      comment ? row(btn(`${ICON.comment} کامنت اول این کانال`, [SCREEN.COMMENT, ACTION.OPEN])) : null,
       row(btn(`${ICON.trash} حذف از لیست‌ها`, [SCREEN.CHAT, ACTION.DROP, from, key])),
       row(
         backBtn([from, ACTION.OPEN]),
@@ -225,13 +298,13 @@ export function queue(view) {
   const total = (q.completed ?? 0) + (q.failed ?? 0);
 
   const text = stack([
-    header(ICON.queue, '<b>صف آرشیو</b>', q.pending ? `${q.pending} در انتظار` : 'خالی'),
+    header(ICON.queue, '<b>صف آرشیو</b>', q.pending ? `${q.pending} در انتطار` : 'خالی'),
     noticeLine(view.notice),
     compact([
       section(ICON.box, 'همین حالا'),
       tree([
         kvRaw('بار کارگرها', ratio(q.running, q.concurrency, 10)),
-        kv('در انتظار', String(q.pending ?? 0)),
+        kv('در انتطار', String(q.pending ?? 0)),
         kv('در حال پردازش', `${q.running ?? 0} از ${q.concurrency ?? 1}`),
       ]),
     ]),
@@ -244,7 +317,7 @@ export function queue(view) {
       ]),
     ]),
     view.confirm?.kind === 'clear'
-      ? toast(ICON.warn, 'کارهای در انتظار حذف می‌شوند. کاری که در حال اجراست ادامه پیدا می‌کند.')
+      ? toast(ICON.warn, 'کارهای در انتطار حذف می‌شوند. کاری که در حال اجراست ادامه پیدا می‌کند.')
       : hint('رسانه محوشونده همیشه از بقیه صف جلو می‌زند.'),
   ]);
 
@@ -267,7 +340,7 @@ export function queue(view) {
 // ------------------------------------------------------------------------ stats
 
 export function stats(view) {
-  const { system = {}, archive = {}, queue: q = {}, mirrorStats = {} } = view;
+  const { system = {}, archive = {}, queue: q = {}, mirrorStats = {}, commentStats = {} } = view;
   const attempts = (archive.archived ?? 0) + (archive.failed ?? 0);
   const average = archive.archived ? (archive.bytes ?? 0) / archive.archived : 0;
 
@@ -289,6 +362,14 @@ export function stats(view) {
         kv('پیام‌های ثبت‌شده', String(mirrorStats.captured ?? 0)),
         kv('ویرایش', String(mirrorStats.edits ?? 0)),
         kv('حذف', String(mirrorStats.deletions ?? 0)),
+      ]),
+    ]),
+    compact([
+      section(ICON.comment, 'کامنت اول'),
+      tree([
+        kv('کانال‌های فعال', String((view.comment ?? []).length)),
+        kv('گذاشته‌شده', String(commentStats.posted ?? 0)),
+        commentStats.failed ? kv('ناموفق', String(commentStats.failed)) : '',
       ]),
     ]),
     compact([
@@ -317,7 +398,7 @@ export function settings(view) {
   const s = view.settings ?? {};
 
   const text = stack([
-    header(ICON.settings, '<b>تنظیمات</b>', 'قابل تغییر در همین لحظه'),
+    header(ICON.settings, '<b>تنطیمات</b>', 'قابل تغییر در همین لحظه'),
     noticeLine(view.notice),
     compact([
       section(ICON.bolt, 'زنده'),
@@ -334,6 +415,7 @@ export function settings(view) {
         kv('کارگر آپلود', String(s.uploadWorkers ?? 0)),
         kv('دانلود همزمان', String(s.maxConcurrentDownloads ?? 0)),
         kv('پنجره آلبوم', `${s.albumWindowMs ?? 0} ms`),
+        kv('تأخیر کامنت اول', `${s.firstCommentDelayMs ?? 0} ms`),
         kv('منطقه زمانی', s.timezone ?? ''),
         kvRaw('بازیابی پس از ری‌استارت', pill(Boolean(s.catchUp))),
       ]),
@@ -374,7 +456,12 @@ export function tools(view) {
       `${BULLET} یوزرنیم، شناسه عددی یا لینک چت را بده.`,
       `${BULLET} برای کانالی که در آن نمی‌شود نوشت، این تنها راه است.`,
     ]),
-    hint(`همین کارها از سمت اکانت خودت هم ممکن است: ${code(cmd('save'))} ${MID} ${code(cmd('mirror'))} ${MID} ${code(cmd('auto'))}`),
+    compact([
+      section(ICON.comment, 'کامنت اول'),
+      `${BULLET} خط اول کانال، خط‌های بعد متن کامنت.`,
+      `${BULLET} به محض انتشار پست جدید، همان متن اولین کامنت می‌شود.`,
+    ]),
+    hint(`همین کارها از سمت اکانت خودت هم ممکن است: ${code(cmd('save'))} ${MID} ${code(cmd('mirror'))} ${MID} ${code(cmd('auto'))} ${MID} ${code(cmd('comment'))}`),
   ]);
 
   return {
@@ -385,6 +472,7 @@ export function tools(view) {
         btn(`${ICON.mirror} افزودن آینه`, [SCREEN.TOOLS, ACTION.PROMPT, 'm']),
         btn(`${ICON.auto} افزودن سیو خودکار`, [SCREEN.TOOLS, ACTION.PROMPT, 'a']),
       ),
+      row(btn(`${ICON.comment} تنظیم کامنت اول`, [SCREEN.TOOLS, ACTION.PROMPT, 'f'])),
       row(backBtn()),
     ),
   };
@@ -422,12 +510,23 @@ const PROMPTS = Object.freeze({
     ],
     note: 'هر رسانه‌ای که در آن چت بیاید خودکار آرشیو می‌شود.',
   },
+  comment: {
+    icon: ICON.comment,
+    title: 'کانال و متن کامنت را بفرست',
+    lines: [
+      `${BULLET} خط اول: ${code('@channel')} یا ${code('-1001234567890')}`,
+      `${BULLET} خط‌های بعد: متن کامنت`,
+      `${BULLET} یک‌خطی هم می‌شود: ${code('@channel | متن کامنت')}`,
+      `${BULLET} در متن: ${code('{title}')} ${code('{link}')} ${code('{id}')} ${code('{date}')}`,
+    ],
+    note: 'کانال باید گروه گفتگو داشته باشد؛ کانالی که از قبل در لیست باشد، متنش عوض می‌شود.',
+  },
 });
 
 export function prompt(view) {
   const spec = PROMPTS[view.awaiting] ?? PROMPTS.auto;
   const text = stack([
-    header(spec.icon, `<b>${esc(spec.title)}</b>`, 'در انتظار پیام تو'),
+    header(spec.icon, `<b>${esc(spec.title)}</b>`, 'در انتطار پیام تو'),
     noticeLine(view.notice),
     compact(spec.lines),
     hint(spec.note),
@@ -454,6 +553,7 @@ export function help(view) {
       section(ICON.game, 'دستورهای اکانت'),
       `${BULLET} ${code(cmd('save'))} روی رسانه ریپلای کن — یا لینک پست را بده.`,
       `${BULLET} ${code(cmd('mirror'))} و ${code(cmd('auto'))} برای روشن و خاموش کردن چت‌ها.`,
+      `${BULLET} ${code(cmd('comment'))} برای اولین کامنت پست‌های یک کانال.`,
       `${BULLET} ${code(cmd('status'))} همان اعدادی است که در این پنل می‌بینی.`,
       `${BULLET} ${code(cmd('panel'))} همین پنل را باز می‌کند.`,
     ]),
@@ -476,6 +576,7 @@ const SCREENS = Object.freeze({
   [SCREEN.HOME]: home,
   [SCREEN.AUTO]: (view) => chats(view, SCREEN.AUTO),
   [SCREEN.MIRROR]: (view) => chats(view, SCREEN.MIRROR),
+  [SCREEN.COMMENT]: comments,
   [SCREEN.CHAT]: chat,
   [SCREEN.QUEUE]: queue,
   [SCREEN.STATS]: stats,
