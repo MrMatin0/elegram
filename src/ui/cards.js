@@ -44,23 +44,25 @@ export const helpCard = () => stack([
     `${MARK} ${chip('mirror on')} ${MID} ${chip('mirror off')} — آینه لحظه‌ای همین چت`,
     `${MARK} ${chip('mirror')} ${code('@username')} — آینه یک کانال/گروه <b>از هر جا</b>`,
     `${MARK} ${chip('mirrorlist')} — چت‌های آینه‌شده`,
+    `${MARK} ${chip('comment')} ${code('@channel | متن')} — اولین کامنت هر پست کانال`,
+    `${MARK} ${chip('commentlist')} — کانال‌های دارای کامنت اول`,
     `${MARK} ${chip('status')} — آمار و وضعیت سیستم`,
     `${MARK} ${chip('id')} — شناسه همین چت`,
-    `${MARK} ${chip('cancel')} — پاک کردن صف انتظار`,
+    `${MARK} ${chip('cancel')} — پاک کردن صف انتطار`,
     `${MARK} ${chip('ping')} — بررسی اتصال و آپ‌تایم`,
     `${MARK} ${chip('help')} — همین راهنما`,
   ]),
   compact([
     section(ICON.panel, 'پنل کنترل'),
     `${BULLET} ${chip('panel')} را بفرست تا لینک پنل شیشه‌ای را بگیری.`,
-    `${BULLET} همه‌ی کارها آنجا با دکمه انجام می‌شود: صف، آینه، سیو خودکار، تنظیمات.`,
+    `${BULLET} همه‌ی کارها آنجا با دکمه انجام می‌شود: صف، آینه، سیو خودکار، تنطیمات.`,
     `${BULLET} دکمه‌های شیشه‌ای فقط از سمت ربات ساخته می‌شوند، پس پنل روی ربات همراه است.`,
   ]),
   compact([
     section(ICON.radar, 'کانال و گروهی که نمی‌شود در آن نوشت'),
     `${BULLET} یوزرنیم یا شناسه عددی را جلوی دستور بگذار: ${code(`${cmd('mirror')} @channel`)}`,
     `${BULLET} شناسه خصوصی هم قبول است: ${code(`${cmd('mirror')} -1001234567890`)}`,
-    `${BULLET} ${chip('auto')} هم دقیقاً همین شکل را می‌پذیرد.`,
+    `${BULLET} ${chip('auto')} و ${chip('comment')} هم دقیقاً همین شکل را می‌پذیرند.`,
     `${BULLET} این دستورها را از داخل Saved Messages خودت بفرست.`,
   ]),
   compact([
@@ -69,6 +71,13 @@ export const helpCard = () => stack([
     `${BULLET} ویرایش شد؟ نسخه قبلی و جدید کنار هم ثبت می‌شوند.`,
     `${BULLET} پاک شد؟ متن اصلی همچنان پیش توست.`,
     `${BULLET} در گروه و کانال هم دقیقاً همین‌طور کار می‌کند.`,
+  ]),
+  compact([
+    section(ICON.comment, 'کامنت اول چطور کار می‌کند؟'),
+    `${BULLET} کانال و متن را یک‌جا بده: ${code(`${cmd('comment')} @channel | متن کامنت`)}`,
+    `${BULLET} تا پست جدید منتشر شود، همین متن اولین کامنت زیر آن می‌شود.`,
+    `${BULLET} کانال باید گروه گفتگو (Discussion) داشته باشد.`,
+    `${BULLET} در متن می‌توانی ${code('{title}')} ${code('{link}')} ${code('{id}')} ${code('{date}')} بگذاری.`,
   ]),
   compact([
     section(ICON.target, 'قابلیت‌های همیشگی'),
@@ -115,7 +124,7 @@ export const statusCard = (s) => stack([
       kv('فایل‌های ذخیره‌شده', String(s.archived)),
       kv('حجم کل', humanBytes(s.bytes)),
       s.failed ? kv('ناموفق', String(s.failed)) : '',
-      kv('صف', `${s.pending} در انتظار ${MID} ${s.running} در حال پردازش`),
+      kv('صف', `${s.pending} در انتطار ${MID} ${s.running} در حال پردازش`),
     ]),
   ]),
   compact([
@@ -129,6 +138,14 @@ export const statusCard = (s) => stack([
       kv('پیام‌های ثبت‌شده', String(s.mirrored ?? 0)),
       kv('ویرایش', String(s.mirrorEdits ?? 0)),
       kv('حذف', String(s.mirrorDeletes ?? 0)),
+    ]),
+  ]),
+  compact([
+    section(ICON.comment, 'کامنت اول'),
+    tree([
+      kv('کانال‌های فعال', String(s.comments ?? 0)),
+      kv('کامنت‌های گذاشته‌شده', String(s.commented ?? 0)),
+      s.commentFails ? kv('ناموفق', String(s.commentFails)) : '',
     ]),
   ]),
   s.panelLink
@@ -155,7 +172,7 @@ export const panelCard = ({ username, owner, configured, ready }) => {
     return stack([
       header(ICON.panel, '<b>پنل کنترل</b>', 'غیرفعال'),
       compact([
-        `${ICON.warn} <b>ربات همراه تنظیم نشده است.</b>`,
+        `${ICON.warn} <b>ربات همراه تنطیم نشده است.</b>`,
         '',
         `${BULLET} یک ربات از @BotFather بساز.`,
         `${BULLET} توکنش را در ${code('BOT_TOKEN')} بگذار و سرویس را ری‌استارت کن.`,
@@ -185,7 +202,7 @@ export const panelCard = ({ username, owner, configured, ready }) => {
  * The target forms exist because the in-chat form cannot work everywhere: a
  * broadcast channel (and a read-only group) gives you nowhere to type.
  */
-const toggleUsage = (name) => [
+const toggleUsage = (name) => (name === 'comment' ? commentUsageLines() : [
   `${MARK} داخل خود چت: ${chip(`${name} on`)} یا ${chip(`${name} off`)}`,
   `${MARK} از هر جا، با یوزرنیم یا شناسه عددی:`,
   code(`${cmd(name)} @username`),
@@ -193,7 +210,7 @@ const toggleUsage = (name) => [
   `${MARK} برای حذف از لیست:`,
   code(`${cmd(name)} off @username`),
   code(`${cmd(name)} off -1001234567890`),
-];
+]);
 
 export const autoUsage = () => stack([
   toast(ICON.warn, 'استفاده صحیح'),
@@ -211,7 +228,7 @@ export const mirrorUsage = () => stack([
 export const savedGuard = (name = 'auto') => stack([
   toast(ICON.info, 'اینجا Saved Messages خودت است'),
   compact([
-    `برای فعال‌سازی، داخل چت موردنظر ${chip(`${name} on`)} را بفرست.`,
+    `برای فعال‌سازی، داخل چت موردنطر ${chip(`${name} on`)} را بفرست.`,
     `اگر آن چت اجازه نوشتن نمی‌دهد، از همین‌جا: ${code(`${cmd(name)} @username`)}`,
   ]),
 ]);
@@ -318,7 +335,7 @@ function chatListCard({ entries, icon, title, empty, name }) {
   if (!list.length) {
     return stack([
       toast(ICON.empty, empty),
-      hint(`داخل چت موردنظر ${chip(`${name} on`)} را بفرست، یا از هر جا: ${code(`${cmd(name)} @username`)}`),
+      hint(`داخل چت موردنطر ${chip(`${name} on`)} را بفرست، یا از هر جا: ${code(`${cmd(name)} @username`)}`),
     ]);
   }
   return stack([
@@ -330,6 +347,116 @@ function chatListCard({ entries, icon, title, empty, name }) {
     ]),
   ]);
 }
+
+// --------------------------------------------------------------- first comment
+
+/**
+ * The `.comment` forms. Kept separate from `toggleUsage` because this toggle
+ * carries a payload: a channel *and* the text to post under its next post.
+ */
+const commentUsageLines = () => [
+  `${MARK} کانال و متن کامنت را با هم بده:`,
+  code(`${cmd('comment')} @channel | متن کامنت`),
+  `${MARK} یا متن را در خط بعد بنویس:`,
+  code(`${cmd('comment')} @channel\nمتن کامنت`),
+  `${MARK} شناسه عددی هم قبول است:`,
+  code(`${cmd('comment')} -1001234567890 | سلام`),
+  `${MARK} برای خاموش کردن:`,
+  code(`${cmd('comment')} off @channel`),
+];
+
+const PLACEHOLDER_HINT = `${ICON.spark} <i>در متن می‌توانی ${code('{title}')} ${code('{link}')} ${code('{id}')} ${code('{date}')} بگذاری؛ هر بار با مقدار همان پست پر می‌شود.</i>`;
+
+export const commentUsage = () => stack([
+  toast(ICON.warn, 'استفاده صحیح'),
+  compact(commentUsageLines()),
+  PLACEHOLDER_HINT,
+  hint(`لیست کانال‌ها: ${chip('commentlist')} ${MID} با دکمه: ${chip('panel')}`),
+]);
+
+export const commentOn = (title, chatKey = '', text = '', updated = false) => stack([
+  header(ICON.comment, `<b>کامنت اول ${updated ? 'به‌روز شد' : 'فعال شد'}</b>`),
+  compact([chatRow(title), idRow(chatKey)]),
+  compact([`${ICON.page} <b>متن کامنت</b>`, quote(text, 400)]),
+  compact([
+    `${BULLET} به محض انتشار هر پست جدید، همین متن اولین کامنت زیر آن می‌شود.`,
+    `${BULLET} کانال باید گروه گفتگو (Discussion) داشته باشد.`,
+    `${BULLET} آلبوم چندتایی یک کامنت می‌گیرد، نه چند تا.`,
+  ]),
+  PLACEHOLDER_HINT,
+]);
+
+export const commentOff = (title, chatKey = '') => stack([
+  header(ICON.stop, '<b>کامنت اول خاموش شد</b>'),
+  compact([chatRow(title), idRow(chatKey)]),
+  `${BULLET} کامنت‌هایی که تا الآن گذاشته شده، سر جایشان می‌مانند.`,
+]);
+
+export const commentAlready = (title, on, chatKey = '') => stack([
+  toast(ICON.info, on ? 'کامنت اول این کانال از قبل روشن بود.' : 'کامنت اول این کانال از قبل خاموش بود.'),
+  compact([chatRow(title), idRow(chatKey)]),
+]);
+
+/** The channel resolved fine; there is just no text to post under its posts. */
+export const commentNoText = (title, chatKey = '') => stack([
+  toast(ICON.think, 'متن کامنت را ندادی'),
+  compact([chatRow(title), idRow(chatKey)]),
+  compact(commentUsageLines()),
+  PLACEHOLDER_HINT,
+]);
+
+export const commentList = (entries) => {
+  const list = Array.isArray(entries) ? entries : Object.entries(entries ?? {});
+  if (!list.length) {
+    return stack([
+      toast(ICON.empty, 'هیچ کانالی کامنت اول ندارد.'),
+      compact(commentUsageLines()),
+    ]);
+  }
+  return stack([
+    header(ICON.comment, `<b>کامنت اول (${list.length})</b>`),
+    list
+      .map(([key, value], index) => [
+        `${index + 1}. <b>${esc(value?.title || key)}</b>`,
+        `    \u251C ${code(key)}${value?.username ? ` ${MID} @${esc(value.username)}` : ''}`,
+        `    \u251C ${quote(value?.text, 160)}`,
+        `    \u2514 ${value?.sent ? `${value.sent} کامنت گذاشته شده` : 'هنوز کامنتی نگذاشته'}`,
+      ].join('\n'))
+      .join('\n'),
+    compact([
+      hint(`حذف: ${code(`${cmd('comment')} off <شناسه>`)}`),
+      hint(`تغییر متن: همین دستور را با متن تازه دوباره بفرست.`),
+    ]),
+  ]);
+};
+
+/** Written into the archive the moment a comment lands. */
+export const commentPostedCard = (info) => stack([
+  header(ICON.comment, '<b>اولین کامنت گذاشته شد</b>', info.count ? `کامنت #${info.count}` : ''),
+  compact([
+    info.title ? chatRow(info.title) : '',
+    info.at ? `${ICON.clock} <i>${esc(info.at)}</i>` : '',
+  ]),
+  quote(info.body, 400),
+  info.link ? link(info.link, 'مشاهده پست') : '',
+]);
+
+/** And when it did not. `reason` is either `discussion` or a server message. */
+export const commentFailedCard = (info) => stack([
+  header(ICON.warn, '<b>کامنت اول گذاشته نشد</b>'),
+  compact([
+    info.title ? chatRow(info.title) : '',
+    info.at ? `${ICON.clock} <i>${esc(info.at)}</i>` : '',
+  ]),
+  info.reason === 'discussion'
+    ? compact([
+      'گروه گفتگوی این کانال پیدا نشد.',
+      `${BULLET} در تنطیمات کانال، Discussion را روشن کن.`,
+      `${BULLET} مطمئن شو با همین اکانت به آن گروه دسترسی داری.`,
+    ])
+    : code(truncate(String(info.reason || 'خطای ناشناخته'), 200)),
+  info.link ? link(info.link, 'مشاهده پست') : '',
+]);
 
 // -------------------------------------------------------------- mirror records
 
