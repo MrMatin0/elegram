@@ -2,21 +2,24 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { log, errText } from './utils/logger.js';
 
-const SCHEMA = 3;
+const SCHEMA = 4;
 
 /**
- * Chat-keyed feature buckets. Both hold the same `{ title, since, username? }`
+ * Chat-keyed feature buckets. They hold the same `{ title, since, username? }`
  * shape, so migration, toggling and listing are written once and reused.
- *   autoSave — archive every media message of that chat
- *   mirror   — keep a live copy of every message of that chat
+ *   autoSave     — archive every media message of that chat
+ *   mirror       — keep a live copy of every message of that chat
+ *   firstComment — write the stored `text` as the first comment under every new
+ *                  post of that channel (see services/comment.js)
  */
-export const BUCKETS = Object.freeze(['autoSave', 'mirror']);
+export const BUCKETS = Object.freeze(['autoSave', 'mirror', 'firstComment']);
 
 const defaults = () => ({
   schema: SCHEMA,
   autoSave: {},
   mirror: {},
-  stats: { archived: 0, bytes: 0, failed: 0, since: Date.now() },
+  firstComment: {},
+  stats: { archived: 0, bytes: 0, failed: 0, comments: 0, since: Date.now() },
 });
 
 const num = (value, fallback = 0) => {
@@ -68,6 +71,13 @@ export class Store {
         // entry whose chat can no longer be resolved.
         const username = handle(value.username);
         if (username) entry.username = username;
+        // The first-comment body, and how many times it has been posted. Both
+        // are per-bucket payload: an entry that never had them keeps not having
+        // them instead of gaining an empty string.
+        const text = String(value.text ?? '').trim();
+        if (text) entry.text = text;
+        const sent = num(value.sent);
+        if (sent) entry.sent = sent;
         out[key] = entry;
       } else if (value) {
         // schema 1 stored a bare `true`.
@@ -86,10 +96,12 @@ export class Store {
         archived: num(stats.archived),
         bytes: num(stats.bytes),
         failed: num(stats.failed),
+        comments: num(stats.comments),
         since: num(stats.since, base.stats.since),
       },
     };
-    // schema <= 2 simply had no `mirror` key; an absent bucket becomes an empty one.
+    // schema <= 2 had no `mirror` key and schema <= 3 no `firstComment` one; an
+    // absent bucket becomes an empty one.
     for (const bucket of BUCKETS) migrated[bucket] = this._chatMap(parsed[bucket]);
     return migrated;
   }
@@ -152,18 +164,27 @@ export class Store {
    * `username` is optional metadata: it is what makes `off @channel` work after
    * the chat itself became unreachable. An existing one is never lost.
    *
+   * `extra` is the bucket's own payload (the first-comment body). Anything the
+   * entry already carries survives a plain re-toggle — only an explicit `extra`
+   * replaces it — so turning a feature off and on again cannot silently wipe a
+   * message the user typed once.
+   *
    * @returns false when nothing changed (unknown key, or already in that state).
    */
-  toggle(bucket, chatKey, title, on, username = '') {
+  toggle(bucket, chatKey, title, on, username = '', extra = null) {
     if (!chatKey) return false;
     const map = this._bucket(bucket);
     if (on) {
       const existing = map[chatKey];
       const name = handle(username) || handle(existing?.username);
+      const extras = extra && typeof extra === 'object' ? extra : {};
       map[chatKey] = {
         title: String(title || chatKey),
         since: existing ? existing.since : Date.now(),
         ...(name ? { username: name } : {}),
+        ...(existing?.text ? { text: existing.text } : {}),
+        ...(existing?.sent ? { sent: existing.sent } : {}),
+        ...extras,
       };
     } else if (!map[chatKey]) {
       return false;
@@ -223,6 +244,48 @@ export class Store {
 
   get mirrorCount() {
     return this.count('mirror');
+  }
+
+  // ------------------------------------------------------------- first comment
+
+  isFirstComment(chatKey) {
+    return this.has('firstComment', chatKey);
+  }
+
+  /**
+   * `text` is the comment body. An empty one keeps whatever was stored before,
+   * which is what makes `.comment @channel` (no text) a re-enable rather than a
+   * way to lose the message.
+   */
+  setFirstComment(chatKey, title, on, username = '', text = '') {
+    const body = String(text ?? '').trim();
+    return this.toggle('firstComment', chatKey, title, on, username, body ? { text: body } : null);
+  }
+
+  firstCommentEntry(chatKey) {
+    return this.entry('firstComment', chatKey);
+  }
+
+  firstCommentEntries() {
+    return this.entries('firstComment');
+  }
+
+  get firstCommentCount() {
+    return this.count('firstComment');
+  }
+
+  /** The stored body, or '' when the channel is not configured at all. */
+  commentText(chatKey) {
+    return String(this.firstCommentEntry(chatKey)?.text ?? '');
+  }
+
+  /** One more comment posted on that channel. @returns its new per-chat count. */
+  countComment(chatKey) {
+    this.data.stats.comments = num(this.data.stats.comments) + 1;
+    const entry = this._bucket('firstComment')[chatKey];
+    if (entry) entry.sent = num(entry.sent) + 1;
+    this.save();
+    return entry ? entry.sent : 0;
   }
 
   /** Either feature is reason enough to keep a chat's media. */
