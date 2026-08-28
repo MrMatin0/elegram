@@ -82,6 +82,33 @@ function timezone(key, fallback) {
   }
 }
 
+/**
+ * A bot token, shaped `<botId>:<secret>`.
+ *
+ * Validated here rather than at first use: a typo in the token means the panel
+ * silently never appears, and "silently" is the part worth fixing.
+ */
+function botToken(key) {
+  const value = raw(key);
+  if (!value) return '';
+  if (!/^\d{6,}:[\w-]{20,}$/.test(value)) {
+    problems.push(`متغیر محیطی ${key} شکل معتبر توکن ربات را ندارد (باید مثل 123456:ABC-DEF… باشد).`);
+    return '';
+  }
+  return value;
+}
+
+/** A numeric Telegram user id. Anything else is a typo worth naming. */
+function userId(key) {
+  const value = raw(key);
+  if (!value) return '';
+  if (!/^\d{5,20}$/.test(value)) {
+    problems.push(`متغیر محیطی ${key} باید شناسه عددی تلگرام باشد (مقدار فعلی: ${value}).`);
+    return '';
+  }
+  return value;
+}
+
 const dataDir = path.resolve(text('DATA_DIR', { fallback: './data' }));
 
 export const config = Object.freeze({
@@ -92,6 +119,12 @@ export const config = Object.freeze({
   storagePeer: text('STORAGE_PEER', { fallback: 'me' }),
   dataDir,
   tmpDir: path.join(dataDir, 'tmp'),
+
+  // Glass buttons are bot-only, so the control panel needs its own identity.
+  // Without a token everything else still works; there is just no panel.
+  botToken: botToken('BOT_TOKEN'),
+  // Defaults to the logged-in account: the panel is yours and nobody else's.
+  panelOwner: userId('PANEL_OWNER'),
 
   port: integer('PORT', 3000, { min: 1, max: 65535 }),
   deviceModel: text('DEVICE_MODEL', { fallback: 'Elegram Desktop' }),
@@ -120,7 +153,7 @@ export function configIssues({ requireSession = false } = {}) {
   return issues;
 }
 
-/** Safe to log: never exposes API_HASH or SESSION. */
+/** Safe to log: never exposes API_HASH, SESSION or BOT_TOKEN. */
 export function configSummary() {
   return {
     apiId: config.apiId,
@@ -132,5 +165,7 @@ export function configSummary() {
     timezone: config.timezone,
     logLevel: config.logLevel,
     hasSession: Boolean(config.session),
+    hasBotToken: Boolean(config.botToken),
+    panelOwner: config.panelOwner || 'self',
   };
 }

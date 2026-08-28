@@ -3,11 +3,9 @@ import { cmd } from '../constants.js';
 import { humanBytes } from '../utils/format.js';
 import { idStr, isSelfDestruct, mediaKind, mediaSize } from '../services/mediaInfo.js';
 import { resolveLinkedMessage, resolveTargetChat } from '../services/lookup.js';
+import { collectAlbum } from '../services/save.js';
 import { isNotModified } from '../utils/retry.js';
 import { log, errText } from '../utils/logger.js';
-
-// A Telegram album holds at most 10 items, so a narrow id window is enough.
-const ALBUM_SPAN = 10;
 
 export function createCommandHandler(ctx) {
   const { client, store, queue, me, archiver, version } = ctx;
@@ -87,32 +85,6 @@ export function createCommandHandler(ctx) {
       return null;
     }
   };
-
-  /**
-   * Collects every sibling of an album.
-   *
-   * v1 asked for a hand-built id range via `getMessages({ ids })`, which pulls
-   * up to 21 mostly-nonexistent ids and throws on some peers. Walking history
-   * around the anchor is both cheaper and correct.
-   */
-  async function collectAlbum(peer, anchor) {
-    const groupId = idStr(anchor?.groupedId);
-    if (!groupId) return [anchor];
-
-    const found = new Map([[anchor.id, anchor]]);
-    try {
-      for await (const item of client.iterMessages(peer, {
-        limit: ALBUM_SPAN * 3,
-        offsetId: anchor.id + ALBUM_SPAN + 1,
-        minId: Math.max(0, anchor.id - ALBUM_SPAN - 1),
-      })) {
-        if (item?.media && idStr(item.groupedId) === groupId) found.set(item.id, item);
-      }
-    } catch (error) {
-      log.warn('خواندن آلبوم ناموفق بود؛ فقط همان پیام آرشیو می‌شود.', errText(error));
-    }
-    return [...found.values()].sort((a, b) => a.id - b.id);
-  }
 
   /** Persist + confirm, shared by both directions of a toggle. */
   const applyToggle = async (msg, spec, on, chatKey, title, username = '') => {
@@ -199,6 +171,9 @@ export function createCommandHandler(ctx) {
     off: cards.mirrorOff,
   };
 
+  /** The panel lives on the companion bot, so its link is built from `ctx`. */
+  const panelLink = () => (ctx.panel?.username ? `https://t.me/${ctx.panel.username}?start=panel` : '');
+
   const handlers = {
     [cmd('ping')]: async (msg) => {
       const sentAt = (Number(msg.date) || 0) * 1000;
@@ -207,6 +182,29 @@ export function createCommandHandler(ctx) {
     },
 
     [cmd('help')]: async (msg) => edit(msg, cards.helpCard()),
+
+    /**
+     * `.panel` — a door, not a panel.
+     *
+     * Glass buttons cannot be attached to anything a *user account* sends, so the
+     * card here hands over the link to the companion bot that can draw them.
+     */
+    [cmd('panel')]: async (msg) => edit(msg, cards.panelCard({
+      username: ctx.panel?.username ?? '',
+      owner: ctx.panel?.owner ?? '',
+      configured: Boolean(ctx.panelConfigured),
+      ready: Boolean(ctx.panel?.ready),
+    })),
+
+    [cmd('id')]: async (msg) => {
+      const chatKey = idStr(msg.chatId);
+      await edit(msg, cards.idCard({
+        title: chatLabel(msg, chatKey),
+        chatKey,
+        kind: String(msg.chat?.className ?? ''),
+        userId: myId,
+      }));
+    },
 
     [cmd('status')]: async (msg) => {
       const stats = queue.stats;
@@ -228,6 +226,8 @@ export function createCommandHandler(ctx) {
         mirrored: mirror.captured,
         mirrorEdits: mirror.edits,
         mirrorDeletes: mirror.deletions,
+        panel: Boolean(ctx.panel?.ready),
+        panelLink: panelLink(),
       }));
     },
 
@@ -286,7 +286,7 @@ export function createCommandHandler(ctx) {
         return;
       }
 
-      const targets = anchor.groupedId ? await collectAlbum(peer, anchor) : [anchor];
+      const targets = anchor.groupedId ? await collectAlbum(client, peer, anchor) : [anchor];
       const media = targets.filter((item) => item?.media);
       if (!media.length) {
         await say(cards.noMedia());

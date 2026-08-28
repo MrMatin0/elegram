@@ -4,6 +4,7 @@ import { config, configIssues, configSummary } from './config.js';
 import { Store } from './store.js';
 import { startHealthServer, stopHealthServer } from './server.js';
 import { registerHandlers } from './handlers/messages.js';
+import { startPanel } from './handlers/panel.js';
 import { connect, createClient, SessionError } from './services/client.js';
 import { log, errText, setLogLevel } from './utils/logger.js';
 
@@ -35,6 +36,10 @@ async function bootstrap() {
     queue: null,
     archiver: null,
     mirror: null,
+    panel: null,
+    // Told apart from `panel` on purpose: the `.panel` card has to explain a
+    // token that was never set differently from one Telegram rejected.
+    panelConfigured: Boolean(config.botToken),
     version: pkg.version,
     startedAt: Date.now(),
     connected: false,
@@ -73,6 +78,9 @@ async function bootstrap() {
       mirrored: ctx.mirror?.stats.captured ?? 0,
       mirrorEdits: ctx.mirror?.stats.edits ?? 0,
       mirrorDeletes: ctx.mirror?.stats.deletions ?? 0,
+      // The panel is optional, so `false` here is a configuration fact, not an
+      // outage: a probe should never restart us over a missing BOT_TOKEN.
+      panel: Boolean(ctx.panel?.ready),
       // State of the socket itself, not just of this HTTP process.
       socket: Boolean(ctx.client?.connected),
     }),
@@ -89,12 +97,17 @@ async function bootstrap() {
 
   registerHandlers(ctx, config);
 
+  // Last, and never fatal: the archiver is the part that cannot be replaced, so
+  // a panel that refuses to start is a warning, not an exit.
+  ctx.panel = await startPanel(ctx, config);
+
   shutdown = async (signal, code = 0) => {
     if (shuttingDown) return;
     shuttingDown = true;
     ctx.connected = false;
     log.warn(`${signal} دریافت شد؛ خاموشی امن…`);
     try {
+      await Promise.resolve(ctx.panel?.stop?.()).catch(() => {});
       ctx.dispose?.();
       store.flush();
       await stopHealthServer(server);
