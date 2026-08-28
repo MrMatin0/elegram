@@ -44,6 +44,7 @@ export const ICON = Object.freeze({
   queue: '\u{1F4E5}',
   auto: '\u{1F501}',
   mirror: '\u{1FA9E}',
+  comment: '\u{1F5E8}\uFE0F',
   stats: '\u{1F4C8}',
   settings: '\u2699\uFE0F',
   tools: '\u{1F9F0}',

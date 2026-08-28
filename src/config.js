@@ -138,6 +138,17 @@ export const config = Object.freeze({
   // ones still throw and are handled by our own retry/backoff.
   floodSleepThreshold: integer('FLOOD_SLEEP_THRESHOLD', 60, { min: 0, max: 600 }),
 
+  // How long to wait after a post before commenting. 0 is "the moment it lands",
+  // which is the whole point; a few seconds is for channels where looking human
+  // matters more than being first.
+  firstCommentDelayMs: integer('FIRST_COMMENT_DELAY_MS', 0, { min: 0, max: 600000 }),
+  // Telegram copies the post into the linked group *after* publishing it, so the
+  // first lookup can legitimately find nothing. This is how many times we ask.
+  firstCommentAttempts: integer('FIRST_COMMENT_ATTEMPTS', 5, { min: 1, max: 20 }),
+  // You may read a linked discussion group without joining it, but not write in
+  // it. Without this, commenting on a channel you only follow always fails.
+  firstCommentJoin: boolean('FIRST_COMMENT_JOIN', true),
+
   timezone: timezone('TIMEZONE', 'Asia/Tehran'),
   logLevel: choice('LOG_LEVEL', 'info', LOG_LEVELS),
   // An empty DONE_REACTION disables the cosmetic "done" reaction entirely.
@@ -167,5 +178,7 @@ export function configSummary() {
     hasSession: Boolean(config.session),
     hasBotToken: Boolean(config.botToken),
     panelOwner: config.panelOwner || 'self',
+    firstCommentDelayMs: config.firstCommentDelayMs,
+    firstCommentJoin: config.firstCommentJoin,
   };
 }
