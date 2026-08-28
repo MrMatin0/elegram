@@ -178,6 +178,17 @@ export class Store {
     return Object.entries(this._bucket(bucket));
   }
 
+  /**
+   * One entry, or null.
+   *
+   * The panel routes on a chat *key* — that is all 64 bytes of callback data can
+   * carry — and still has to draw a title, so it needs to look one up cheaply.
+   */
+  entry(bucket, chatKey) {
+    if (!chatKey) return null;
+    return this._bucket(bucket)[chatKey] ?? null;
+  }
+
   count(bucket) {
     return Object.keys(this._bucket(bucket)).length;
   }
