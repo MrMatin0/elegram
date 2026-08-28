@@ -31,6 +31,24 @@ export class TaskQueue {
     return { pending: this.pending, running: this.running, completed: this.completed, failed: this.failed };
   }
 
+  /**
+   * Live concurrency change, for the panel's ± buttons.
+   *
+   * Raising it has to drain immediately: without that, the extra worker sits
+   * idle until the next task happens to arrive, which looks exactly like the
+   * setting having no effect.
+   */
+  setConcurrency(value) {
+    const next = Math.max(1, Math.floor(Number(value) || 1));
+    if (next === this.concurrency) return this.concurrency;
+    const raised = next > this.concurrency;
+    this.concurrency = next;
+    // Lowering it never interrupts work in flight; the surplus simply retires as
+    // each running task finishes.
+    if (raised) this._drain();
+    return this.concurrency;
+  }
+
   add(task, { priority = false } = {}) {
     if (this._closed) return Promise.reject(new Error('صف بسته شده است.'));
     return new Promise((resolve, reject) => {
