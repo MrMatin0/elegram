@@ -19,10 +19,11 @@ import { BotApi, isNotModified, isUnreachable } from '../services/bot.js';
 import { mediaFromLink } from '../services/save.js';
 import { resolveTargetChat } from '../services/lookup.js';
 import { idStr, isSelfDestruct, mediaKind, mediaSize } from '../services/mediaInfo.js';
+import { parseCommentInput } from '../utils/comment.js';
 import { humanBytes } from '../utils/format.js';
 import { log, errText, LOG_LEVELS, setLogLevel, currentLogLevel } from '../utils/logger.js';
 
-const PROMPTS = Object.freeze({ a: 'auto', m: 'mirror', s: 'save' });
+const PROMPTS = Object.freeze({ a: 'auto', m: 'mirror', s: 'save', f: 'comment' });
 const BUCKET_SCREEN = Object.freeze({ [SCREEN.AUTO]: 'autoSave', [SCREEN.MIRROR]: 'mirror' });
 const CONCURRENCY_RANGE = Object.freeze({ min: 1, max: 8 });
 
@@ -53,7 +54,7 @@ const freshState = () => ({
  */
 export async function startPanel(ctx, config, { bot: injected = null } = {}) {
   if (!config.botToken && !injected) {
-    log.info('[panel] BOT_TOKEN تنظیم نشده؛ پنل شیشه‌ای غیرفعال است.');
+    log.info('[panel] BOT_TOKEN تنطیم نشده؛ پنل شیشه‌ای غیرفعال است.');
     return null;
   }
 
@@ -78,7 +79,10 @@ export async function startPanel(ctx, config, { bot: injected = null } = {}) {
   // ------------------------------------------------------------------ snapshot
 
   const entryOf = (chatKey) =>
-    store.entry?.('autoSave', chatKey) ?? store.entry?.('mirror', chatKey) ?? null;
+    store.entry?.('autoSave', chatKey)
+    ?? store.entry?.('mirror', chatKey)
+    ?? store.entry?.('firstComment', chatKey)
+    ?? null;
 
   const buildView = (state) => ({
     screen: state.screen,
@@ -104,7 +108,9 @@ export async function startPanel(ctx, config, { bot: injected = null } = {}) {
     queue: { ...queue.stats, concurrency: queue.concurrency },
     auto: store.autoEntries(),
     mirror: store.mirrorEntries(),
+    comment: store.firstCommentEntries(),
     mirrorStats: ctx.mirror?.stats ?? { captured: 0, edits: 0, deletions: 0 },
+    commentStats: ctx.firstComment?.stats ?? { posted: 0, failed: 0, skipped: 0 },
     settings: {
       concurrency: queue.concurrency,
       doneReaction: archiver?.doneReaction ?? '',
@@ -113,6 +119,7 @@ export async function startPanel(ctx, config, { bot: injected = null } = {}) {
       uploadWorkers: config.uploadWorkers,
       maxConcurrentDownloads: config.maxConcurrentDownloads,
       albumWindowMs: config.albumWindowMs,
+      firstCommentDelayMs: config.firstCommentDelayMs,
       timezone: config.timezone,
       catchUp: config.catchUp,
     },
@@ -122,6 +129,7 @@ export async function startPanel(ctx, config, { bot: injected = null } = {}) {
         entry: entryOf(state.chatKey),
         auto: store.isAuto(state.chatKey),
         mirror: store.isMirror(state.chatKey),
+        comment: store.isFirstComment(state.chatKey),
       }
       : null,
   });
@@ -206,6 +214,38 @@ export async function startPanel(ctx, config, { bot: injected = null } = {}) {
     state.page = 0;
   };
 
+  /**
+   * Adds — or rewrites — the first comment of a channel from typed input.
+   *
+   * The parser is the same pure function `.comment` uses, so `@channel` on the
+   * first line with the body under it behaves identically in both places.
+   */
+  const addComment = async (state, raw) => {
+    const { target, text } = parseCommentInput(raw);
+    if (!target) {
+      notify(state, ICON.no, 'خط اول باید کانال باشد.');
+      state.screen = SCREEN.COMMENT;
+      return;
+    }
+    const found = await resolveTargetChat(client, target, { store, bucket: 'firstComment' });
+    if (found.failure) {
+      notify(state, ICON.no, 'این کانال را نشناختم.');
+      state.screen = SCREEN.COMMENT;
+      return;
+    }
+    const existing = store.firstCommentEntry(found.chatKey);
+    const body = text || String(existing?.text ?? '');
+    if (!body) {
+      notify(state, ICON.think, 'متن کامنت را در خط بعدی بنویس.');
+      state.screen = SCREEN.COMMENT;
+      return;
+    }
+    store.setFirstComment(found.chatKey, found.title, true, found.username, body);
+    notify(state, ICON.ok, `«${found.title}» ${existing ? 'متنش عوض شد' : 'اضافه شد'}.`);
+    state.screen = SCREEN.COMMENT;
+    state.page = 0;
+  };
+
   /** Queues a post link, exactly like `.save <link>` from the account itself. */
   const saveLink = async (state, raw) => {
     const found = await mediaFromLink(client, raw);
@@ -245,7 +285,7 @@ export async function startPanel(ctx, config, { bot: injected = null } = {}) {
       return;
     }
     queue.setConcurrency(clamped);
-    notify(state, ICON.ok, `همزمانی روی ${clamped} تنظیم شد.`);
+    notify(state, ICON.ok, `همزمانی روی ${clamped} تنطیم شد.`);
   };
 
   const cycleLogLevel = (state) => {
@@ -296,6 +336,35 @@ export async function startPanel(ctx, config, { bot: injected = null } = {}) {
         break;
       }
 
+      /**
+       * The first-comment list. Its `off` is a two-step confirm like every other
+       * removal, and its `add` doubles as `edit`: the prompt stores whatever body
+       * comes back, replacing the previous one.
+       */
+      case SCREEN.COMMENT: {
+        state.screen = SCREEN.COMMENT;
+        state.chatKey = '';
+        if (action === ACTION.PAGE) {
+          state.page = Number(arg) || 0;
+          state.confirm = null;
+        } else if (action === ACTION.PROMPT) {
+          state.awaiting = 'comment';
+          state.confirm = null;
+        } else if (action === ACTION.DROP) {
+          state.confirm = arg ? { kind: 'comment', key: arg } : null;
+        } else if (action === ACTION.CONFIRM) {
+          const title = store.firstCommentEntry(arg)?.title || arg;
+          store.setFirstComment(arg, title, false);
+          state.confirm = null;
+          state.page = 0;
+          notify(state, ICON.ok, `کامنت اول «${title}» خاموش شد.`);
+        } else {
+          state.confirm = null;
+          if (action !== ACTION.REFRESH) state.page = 0;
+        }
+        break;
+      }
+
       case SCREEN.CHAT: {
         // args[0] means two different things by design, and mixing them up is the
         // one bug that would send "back" to the wrong list: on a toggle it is the
@@ -318,6 +387,7 @@ export async function startPanel(ctx, config, { bot: injected = null } = {}) {
           const title = titleFor(key);
           store.setAuto(key, title, false);
           store.setMirror(key, title, false);
+          store.setFirstComment(key, title, false);
           state.confirm = null;
           state.chatKey = '';
           state.screen = state.from;
@@ -432,6 +502,7 @@ export async function startPanel(ctx, config, { bot: injected = null } = {}) {
     state.awaiting = null;
     try {
       if (pending === 'save') await saveLink(state, text);
+      else if (pending === 'comment') await addComment(state, text);
       else await addTarget(state, pending, text);
     } catch (error) {
       log.error('[panel] پردازش ورودی ناموفق بود:', errText(error));
