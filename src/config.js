@@ -20,7 +20,7 @@ const isSet = (key) => typeof process.env[key] === 'string';
 function text(key, { required = false, fallback = '' } = {}) {
   const value = raw(key);
   if (!value) {
-    if (required) problems.push(`متغیر محیطی ${key} تنظیم نشده است.`);
+    if (required) problems.push(`متغیر محیطی ${key} تنطیم نشده است.`);
     return fallback;
   }
   return value;
@@ -29,7 +29,7 @@ function text(key, { required = false, fallback = '' } = {}) {
 function integer(key, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER, required = false } = {}) {
   const value = raw(key);
   if (!value) {
-    if (required) problems.push(`متغیر محیطی ${key} تنظیم نشده است.`);
+    if (required) problems.push(`متغیر محیطی ${key} تنطیم نشده است.`);
     return fallback;
   }
   const parsed = Number(value);
@@ -143,11 +143,25 @@ export const config = Object.freeze({
   // matters more than being first.
   firstCommentDelayMs: integer('FIRST_COMMENT_DELAY_MS', 0, { min: 0, max: 600000 }),
   // Telegram copies the post into the linked group *after* publishing it, so the
-  // first lookup can legitimately find nothing. This is how many times we ask.
-  firstCommentAttempts: integer('FIRST_COMMENT_ATTEMPTS', 5, { min: 1, max: 20 }),
+  // first lookup can legitimately find nothing. This is how many times we ask —
+  // cheap now that the gap between two asks is measured in milliseconds.
+  firstCommentAttempts: integer('FIRST_COMMENT_ATTEMPTS', 12, { min: 1, max: 60 }),
+  // The first of those gaps, in ms. Every next one is ~1.4× longer. Small on
+  // purpose: the copy usually lands within a few hundred ms, and every extra ms
+  // spent waiting is another comment landing above ours.
+  firstCommentPollMs: integer('FIRST_COMMENT_POLL_MS', 150, { min: 50, max: 5000 }),
+  // Total budget for finding that copy. Past it, the post is written off.
+  firstCommentTimeoutMs: integer('FIRST_COMMENT_TIMEOUT_MS', 10000, { min: 1000, max: 120000 }),
+  // Floor between two comment *sends*. Telegram punishes bursts of sends far
+  // harder than edits, so lowering this buys speed with flood risk.
+  firstCommentSendGapMs: integer('FIRST_COMMENT_SEND_GAP_MS', 400, { min: 0, max: 60000 }),
   // You may read a linked discussion group without joining it, but not write in
   // it. Without this, commenting on a channel you only follow always fails.
   firstCommentJoin: boolean('FIRST_COMMENT_JOIN', true),
+  // Resolve (and join) every configured channel's discussion group at startup
+  // instead of mid-race. Being inside the group is also what lets us see the
+  // copy of a post arrive live, which is the fastest path to a comment.
+  firstCommentWarm: boolean('FIRST_COMMENT_WARM', true),
 
   timezone: timezone('TIMEZONE', 'Asia/Tehran'),
   logLevel: choice('LOG_LEVEL', 'info', LOG_LEVELS),
@@ -179,6 +193,9 @@ export function configSummary() {
     hasBotToken: Boolean(config.botToken),
     panelOwner: config.panelOwner || 'self',
     firstCommentDelayMs: config.firstCommentDelayMs,
+    firstCommentPollMs: config.firstCommentPollMs,
+    firstCommentSendGapMs: config.firstCommentSendGapMs,
     firstCommentJoin: config.firstCommentJoin,
+    firstCommentWarm: config.firstCommentWarm,
   };
 }

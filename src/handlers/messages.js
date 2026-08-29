@@ -37,7 +37,11 @@ export function registerHandlers(ctx, config) {
   const firstComment = new FirstCommentService(client, store, archiver, {
     delayMs: config.firstCommentDelayMs,
     attempts: config.firstCommentAttempts,
+    pollMs: config.firstCommentPollMs,
+    timeoutMs: config.firstCommentTimeoutMs,
+    sendGapMs: config.firstCommentSendGapMs,
     join: config.firstCommentJoin,
+    warm: config.firstCommentWarm,
     timezone: config.timezone,
     myId,
   });
@@ -95,9 +99,16 @@ export function registerHandlers(ctx, config) {
    * A candidate for the first comment. The service does every check itself
    * (configured channel? a real post? not one of our own commands? already
    * commented on?), so both directions can hand it everything they see.
+   *
+   * `noteCopy` comes first and is the fast path: a post's auto-forwarded copy in
+   * the linked discussion group is an ordinary message on this very stream, and
+   * it is the message a comment has to reply to. Recognising it here means the
+   * comment goes out the moment the copy lands, instead of after a lookup that
+   * can only answer later.
    */
   const onPost = (msg) => {
     try {
+      firstComment.noteCopy(msg);
       void firstComment.onPost(msg);
     } catch (error) {
       log.error('خطای پردازش کامنت اول:', errText(error));
@@ -210,5 +221,10 @@ export function registerHandlers(ctx, config) {
   if (store.firstCommentCount) {
     log.info(`کامنت اول فعال روی ${store.firstCommentCount} کانال${firstComment.available ? '' : ' (غیرفعال: سازنده‌های TL در دسترس نیست)'}`);
   }
+  // In the background and never fatal: every round trip paid here is one the
+  // first comment does not pay while a post is racing.
+  void firstComment.warmUp().catch((error) => {
+    log.debug('آماده‌سازی کامنت اول ناموفق بود:', errText(error));
+  });
   return { archiver, queue, albums, mirror, firstComment };
 }

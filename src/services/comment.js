@@ -7,7 +7,7 @@ import * as cards from '../ui/cards.js';
 import { COMMAND_PATTERN } from '../constants.js';
 import { renderComment } from '../utils/comment.js';
 import { faDate } from '../utils/format.js';
-import { LruSet } from '../utils/lru.js';
+import { LruMap, LruSet } from '../utils/lru.js';
 import { sleep, withRetry } from '../utils/retry.js';
 import { buildMessageLink, displayName, idStr } from './mediaInfo.js';
 import { log, errText } from '../utils/logger.js';
@@ -15,10 +15,17 @@ import { log, errText } from '../utils/logger.js';
 const Api = teleproto?.Api ?? null;
 
 const SEEN_LIMIT = 1024;
-/** Grows with every attempt: 1.2s, 2.4s, 3.6s … */
-const LOOKUP_GAP_MS = 1200;
-/** Comments are *sends*, which Telegram punishes in bursts far harder than edits. */
-const MIN_SEND_GAP_MS = 600;
+/** Thread targets, keyed by the post they belong to. */
+const COPY_LIMIT = 512;
+/** One linked-group peer per watched channel. */
+const GROUP_LIMIT = 256;
+/** Whatever the configuration says, a poll gap lives inside this window. */
+const POLL_MIN_MS = 50;
+const POLL_MAX_MS = 1000;
+/** Every gap is this much longer than the one before: 150, 210, 294 … */
+const POLL_GROWTH = 1.4;
+/** Between two channels while warming up. Startup is not a race. */
+const WARM_GAP_MS = 1200;
 
 /**
  * Telegram publishes the post first and copies it into the linked group a moment
@@ -34,6 +41,10 @@ const textOf = (msg) => String(msg?.message ?? msg?.text ?? '').trim();
 
 /** teleproto pads unknown ids with MessageEmpty instead of leaving a hole. */
 const isReal = (item) => Boolean(item?.id) && item.className !== 'MessageEmpty';
+
+/** `-100…` is how a channel id is written everywhere the user sees one. */
+const bare = (value) => idStr(value).replace(/^-100/, '');
+const marked = (value) => (bare(value) ? `-100${bare(value)}` : '');
 
 /** Reading `msg.chat` can throw on a peer teleproto has not resolved yet. */
 const chatOf = (msg) => {
@@ -58,8 +69,25 @@ export function isChannelPost(msg) {
  * is published its stored body is written as a reply in the channel's linked
  * discussion group — which is what a "comment" on a channel post actually is:
  * Telegram forwards the post into the linked group and every comment is a reply
- * to that copy. `messages.GetDiscussionMessage` is the one call that hands us
- * that copy, so the whole feature is: find it, reply to it, once per post.
+ * to that copy.
+ *
+ * Being *first* is the whole feature, so the hot path is built around the one
+ * thing we cannot control — how long Telegram takes to copy the post into the
+ * linked group — and around never adding a millisecond of our own:
+ *
+ *   · **push before pull.** Once we are a member of the linked group, that copy
+ *     arrives as an ordinary update. `noteCopy()` indexes it, so the common case
+ *     needs *no* `GetDiscussionMessage` round trip at all: the comment is sent
+ *     the instant the copy lands.
+ *   · **tight polling as the fallback.** For groups we are not in, the lookup is
+ *     retried on a small growing gap (150ms, 210ms …) inside a total deadline,
+ *     instead of the old 1.2s/2.4s/3.6s ladder that lost the race by seconds.
+ *   · **the send queue holds sends only.** Resolving the thread, writing the
+ *     archive receipt and bumping counters all happen off the serialized lane,
+ *     so post #2 no longer waits for post #1's paperwork.
+ *   · **pay at startup.** `warmUp()` resolves and joins every configured
+ *     channel's linked group up front, so the first post of a session is as fast
+ *     as the tenth.
  *
  * Why an album needs care: a multi-item post arrives as N separate updates with
  * one shared `groupedId`. Keyed by post id it would earn N identical comments,
@@ -68,11 +96,15 @@ export function isChannelPost(msg) {
 export class FirstCommentService {
   constructor(client, store, archiver, {
     delayMs = 0,
-    attempts = 5,
+    attempts = 12,
     join = true,
     timezone,
     myId = '',
     report = true,
+    pollMs = 150,
+    timeoutMs = 10000,
+    sendGapMs = 400,
+    warm = true,
   } = {}) {
     this.client = client;
     this.store = store;
@@ -83,11 +115,22 @@ export class FirstCommentService {
     this.timezone = timezone;
     this.myId = idStr(myId);
     this.report = Boolean(report);
+    this.pollMs = Math.min(POLL_MAX_MS, Math.max(POLL_MIN_MS, Number(pollMs) || POLL_MIN_MS));
+    this.timeoutMs = Math.max(1000, Number(timeoutMs) || 1000);
+    this.sendGapMs = Math.max(0, Number(sendGapMs) || 0);
+    this.warmEnabled = Boolean(warm);
     this.seen = new LruSet(SEEN_LIMIT);
+    /** post → the message in the linked group that a comment replies to. */
+    this.copies = new LruMap(COPY_LIMIT);
+    /** post → callbacks waiting for that copy to show up. */
+    this.waiters = new Map();
+    /** channel → its linked group, resolved once. */
+    this.groups = new LruMap(GROUP_LIMIT);
+    this.warmed = new Set();
     // A group we already tried to join once; a second failure is not worth a
     // second request.
     this.joined = new Set();
-    this.stats = { posted: 0, failed: 0, skipped: 0 };
+    this.stats = { posted: 0, failed: 0, skipped: 0, instant: 0, lastMs: 0 };
     this._chain = Promise.resolve();
     this._nextSendAt = 0;
     if (!Api) {
@@ -101,7 +144,13 @@ export class FirstCommentService {
 
   // ------------------------------------------------------------------ plumbing
 
-  /** One serialized lane with a floor between sends. */
+  /**
+   * One serialized lane with a floor between sends.
+   *
+   * It wraps the `sendMessage` and nothing else. Everything slower than the send
+   * itself — the thread lookup, the archive receipt — deliberately runs outside,
+   * because a lane that also carries paperwork makes every *other* post late.
+   */
   lane(task) {
     const run = async () => {
       const wait = this._nextSendAt - Date.now();
@@ -109,7 +158,7 @@ export class FirstCommentService {
       try {
         return await task();
       } finally {
-        this._nextSendAt = Date.now() + MIN_SEND_GAP_MS;
+        this._nextSendAt = Date.now() + this.sendGapMs;
       }
     };
     this._chain = this._chain.then(run, run);
@@ -135,6 +184,82 @@ export class FirstCommentService {
     }
   }
 
+  // -------------------------------------------------------- the copy fast path
+
+  key(chatKey, postId) {
+    return `${marked(chatKey)}|${postId}`;
+  }
+
+  /**
+   * A message seen live in some group, which may be the auto-forwarded copy of a
+   * post we are about to comment on.
+   *
+   * Telegram stamps that copy with the channel and message id it came from, so
+   * recognising it is exact rather than a guess — and it arrives on the same
+   * update stream as everything else, which makes it *earlier* than any answer
+   * `GetDiscussionMessage` could give us. Cheap enough to call on every message:
+   * two field reads for anything that is not a copy.
+   */
+  noteCopy(msg) {
+    if (!Api || !msg?.id) return;
+    let fwd = null;
+    try {
+      fwd = msg.fwdFrom ?? null;
+    } catch {
+      return;
+    }
+    if (!fwd) return;
+    const source = bare(fwd.savedFromPeer?.channelId ?? fwd.fromId?.channelId);
+    const postId = Number(fwd.savedFromMsgId ?? fwd.channelPost ?? 0);
+    if (!source || !postId) return;
+    const chatKey = marked(source);
+    if (!this.store.isFirstComment(chatKey)) return;
+    const key = this.key(chatKey, postId);
+    if (this.copies.has(key)) return;
+    void this.indexCopy(key, msg);
+  }
+
+  /** Records the copy and hands it to whoever is already waiting for it. */
+  async indexCopy(key, msg) {
+    const peer = await this.peerOf(msg);
+    if (!peer) return;
+    const target = { peer, chatKey: idStr(msg.chatId), msgId: msg.id, pushed: true };
+    this.copies.set(key, target);
+    const list = this.waiters.get(key);
+    if (!list) return;
+    this.waiters.delete(key);
+    for (const done of list) done(target);
+  }
+
+  /**
+   * Resolves as soon as the copy is indexed, or with null after `ms`.
+   *
+   * This is what the poll loop sleeps on instead of a blind `sleep`: waiting for
+   * a copy that may arrive in 40ms should not cost the rest of the gap.
+   */
+  waitForCopy(key, ms) {
+    return new Promise((resolve) => {
+      let done = null;
+      const timer = setTimeout(() => {
+        const list = this.waiters.get(key);
+        if (list) {
+          const at = list.indexOf(done);
+          if (at >= 0) list.splice(at, 1);
+          if (!list.length) this.waiters.delete(key);
+        }
+        resolve(null);
+      }, Math.max(0, ms));
+      timer.unref?.();
+      done = (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      };
+      const list = this.waiters.get(key);
+      if (list) list.push(done);
+      else this.waiters.set(key, [done]);
+    });
+  }
+
   // -------------------------------------------------------------------- events
 
   /**
@@ -156,10 +281,10 @@ export class FirstCommentService {
       if (COMMAND_PATTERN.test(String(msg.message ?? ''))) return null;
 
       // One comment per post — and per album, which arrives as N updates.
-      const key = msg.groupedId != null
+      const dedupe = msg.groupedId != null
         ? `${chatKey}|g${idStr(msg.groupedId)}`
         : `${chatKey}|${msg.id}`;
-      if (this.seen.add(key)) return null;
+      if (this.seen.add(dedupe)) return null;
 
       const entry = this.store.firstCommentEntry(chatKey);
       const template = String(entry?.text ?? '');
@@ -183,7 +308,10 @@ export class FirstCommentService {
         return null;
       }
 
-      return this.lane(() => this.comment(msg, { chatKey, title, link, body }));
+      // A channel enabled after startup has never been warmed. Do it in the
+      // background — this post takes the polling path, the next one will not.
+      this.warmLater(chatKey, title);
+      return await this.comment(msg, { chatKey, title, link, body, at: Date.now() });
     } catch (error) {
       log.error('[comment] پردازش پست ناموفق بود:', errText(error));
       return null;
@@ -191,14 +319,21 @@ export class FirstCommentService {
   }
 
   /** Resolve the thread, write the comment, report. Never throws. */
-  async comment(msg, { chatKey, title, link, body }) {
-    if (this.delayMs) await sleep(this.delayMs);
+  async comment(msg, { chatKey, title, link, body, at = Date.now() }) {
+    // The optional "look human" delay is served *while* the thread is being
+    // resolved, not before it: waiting is not a reason to postpone a lookup.
+    const [thread] = await Promise.all([
+      this.discussion(msg).catch((error) => {
+        log.debug('[comment] یافتن گروه گفتگو ناموفق بود:', errText(error));
+        return null;
+      }),
+      this.delayMs ? sleep(this.delayMs) : null,
+    ]);
 
-    const thread = await this.discussion(msg);
     if (!thread) {
       this.stats.failed += 1;
       log.warn(`[comment] گروه گفتگوی «${title}» پیدا نشد؛ کامنت گذاشته نشد.`);
-      await this.say(cards.commentFailedCard({
+      void this.say(cards.commentFailedCard({
         title,
         link,
         reason: 'discussion',
@@ -207,24 +342,14 @@ export class FirstCommentService {
       return null;
     }
 
+    let sent = null;
     try {
-      const sent = await this.write(thread, body);
-      this.stats.posted += 1;
-      const count = this.store.countComment(chatKey);
-      log.ok(`[comment] اولین کامنت پست ${msg.id} در «${title}» گذاشته شد.`);
-      await this.say(cards.commentPostedCard({
-        title,
-        link,
-        body,
-        count,
-        at: faDate(new Date(), this.timezone),
-      }));
-      return sent;
+      sent = await this.lane(() => this.write(thread, body));
     } catch (error) {
       this.stats.failed += 1;
       const reason = errText(error);
       log.warn(`[comment] ارسال کامنت در «${title}» ناموفق بود:`, reason);
-      await this.say(cards.commentFailedCard({
+      void this.say(cards.commentFailedCard({
         title,
         link,
         reason,
@@ -232,52 +357,92 @@ export class FirstCommentService {
       }));
       return null;
     }
+
+    // Everything below is bookkeeping. It runs after the comment is already on
+    // Telegram's side, and none of it is allowed to delay the next one.
+    this.stats.posted += 1;
+    if (thread.pushed) this.stats.instant += 1;
+    this.stats.lastMs = Date.now() - at;
+    const count = this.store.countComment(chatKey);
+    log.ok(`[comment] اولین کامنت پست ${msg.id} در «${title}» گذاشته شد (${this.stats.lastMs}ms).`);
+    void this.say(cards.commentPostedCard({
+      title,
+      link,
+      body,
+      count,
+      at: faDate(new Date(), this.timezone),
+    }));
+    return sent;
   }
 
   /**
    * The post's copy inside the linked discussion group — the message every
    * comment on that post replies to.
+   *
+   * Two ways to get it, cheapest first: the live update we may already have
+   * indexed, and `messages.GetDiscussionMessage`. The gaps between asks are
+   * small and grow slowly, and each one is spent *watching* for the copy rather
+   * than sleeping through it, so whichever source wins we act immediately.
    */
   async discussion(msg) {
+    const key = this.key(msg.chatId, msg.id);
+    const known = this.copies.get(key);
+    if (known) return known;
+
     const peer = await this.peerOf(msg);
+    const deadline = Date.now() + this.timeoutMs;
+    let gap = this.pollMs;
+
     for (let attempt = 0; attempt < this.attempts; attempt += 1) {
-      if (attempt) await sleep(LOOKUP_GAP_MS * attempt);
+      const pushed = this.copies.get(key);
+      if (pushed) return pushed;
       try {
         const found = await withRetry(
           () => this.client.invoke(new Api.messages.GetDiscussionMessage({ peer, msgId: msg.id })),
           { label: 'getDiscussionMessage', retries: 1 },
         );
         const thread = (found?.messages ?? []).find(isReal);
-        if (!thread) continue;
-        const target = this.threadPeer(found, thread);
-        if (target) return { peer: target.peer, chatKey: target.chatKey, msgId: thread.id };
+        const target = thread ? this.threadPeer(found, thread, msg.chatId) : null;
+        if (target) {
+          const resolved = { peer: target.peer, chatKey: target.chatKey, msgId: thread.id };
+          this.copies.set(key, resolved);
+          return resolved;
+        }
       } catch (error) {
         const text = errText(error);
         log.debug(`[comment] یافتن پیام گفتگو (تلاش ${attempt + 1}) ناموفق بود:`, text);
         // Only the race is worth another attempt.
         if (!RACE.test(text)) break;
       }
+      const left = deadline - Date.now();
+      if (left <= 0) break;
+      const waited = await this.waitForCopy(key, Math.min(gap, left));
+      if (waited) return waited;
+      gap = Math.min(POLL_MAX_MS, Math.round(gap * POLL_GROWTH));
     }
-    return null;
+    return this.copies.get(key) ?? null;
   }
 
   /**
    * An input peer for the discussion group, built from the access hash the same
    * response carries. Reading it from there — instead of asking teleproto to
    * resolve the peer — is what lets us comment in a group this session has never
-   * opened.
+   * opened. A peer cached at warm-up covers the case where the response omits
+   * the hash.
    */
-  threadPeer(found, thread) {
-    const channelId = idStr(thread?.peerId?.channelId);
-    const chat = (found?.chats ?? []).find((item) => idStr(item?.id) === channelId);
+  threadPeer(found, thread, sourceKey = '') {
+    const channelId = bare(thread?.peerId?.channelId);
+    const chat = (found?.chats ?? []).find((item) => bare(item?.id) === channelId);
     if (chat?.accessHash != null) {
       return {
         peer: new Api.InputPeerChannel({ channelId: chat.id, accessHash: chat.accessHash }),
-        chatKey: `-100${channelId}`,
+        chatKey: marked(channelId),
       };
     }
+    const warm = this.groups.get(marked(sourceKey));
+    if (warm?.peer) return { peer: warm.peer, chatKey: warm.chatKey };
     if (!thread?.peerId) return null;
-    return { peer: thread.peerId, chatKey: channelId ? `-100${channelId}` : '' };
+    return { peer: thread.peerId, chatKey: marked(channelId) };
   }
 
   /**
@@ -308,6 +473,83 @@ export class FirstCommentService {
     } catch (error) {
       log.warn('[comment] عضو شدن در گروه گفتگو ناموفق بود:', errText(error));
       return false;
+    }
+  }
+
+  // ------------------------------------------------------------------- warm-up
+
+  /**
+   * Everything that can be paid for before a post exists.
+   *
+   * Resolving a channel's linked group and joining it used to happen *during* the
+   * race — the join only after a send had already been rejected, which is one
+   * failed send plus two round trips at the exact moment they cost the most.
+   * Doing it at startup also puts us inside the group, which is what turns the
+   * copy of every future post into an update we simply receive.
+   */
+  async warmUp() {
+    if (!Api || !this.warmEnabled) return 0;
+    const entries = this.store.firstCommentEntries();
+    if (!entries.length) return 0;
+    let ready = 0;
+    for (const [chatKey, entry] of entries) {
+      if (ready) await sleep(WARM_GAP_MS);
+      if (await this.warmChannel(chatKey, entry?.title, entry?.username)) ready += 1;
+    }
+    if (ready) log.info(`[comment] گروه گفتگوی ${ready} کانال آماده شد؛ کامنت اول بدون تأخیر می‌رود.`);
+    return ready;
+  }
+
+  /** Fire-and-forget warm-up for a channel enabled while we were running. */
+  warmLater(chatKey, title) {
+    if (!Api || !this.warmEnabled || this.warmed.has(marked(chatKey))) return;
+    void this.warmChannel(chatKey, title);
+  }
+
+  /** Resolves one channel's linked group, caches its peer, and joins it. */
+  async warmChannel(chatKey, title = '', username = '') {
+    const key = marked(chatKey);
+    if (!key || this.warmed.has(key)) return false;
+    this.warmed.add(key);
+    const label = title || key;
+    try {
+      const channel = await this.entityOf(key, username);
+      if (!channel) return false;
+      const full = await this.client.invoke(new Api.channels.GetFullChannel({ channel }));
+      const linkedId = bare(full?.fullChat?.linkedChatId);
+      if (!linkedId) {
+        log.warn(`[comment] «${label}» گروه گفتگو ندارد؛ کامنتی نمی‌شود گذاشت.`);
+        return false;
+      }
+      const chat = (full?.chats ?? []).find((item) => bare(item?.id) === linkedId);
+      if (chat?.accessHash == null) return false;
+      const group = {
+        peer: new Api.InputPeerChannel({ channelId: chat.id, accessHash: chat.accessHash }),
+        chatKey: marked(linkedId),
+      };
+      this.groups.set(key, group);
+      // Already a member? Telegram answers this happily and nothing changes.
+      if (this.join && !this.joined.has(group.chatKey)) {
+        if (await this.joinDiscussion(group.peer)) this.joined.add(group.chatKey);
+      }
+      return true;
+    } catch (error) {
+      log.debug(`[comment] آماده‌سازی «${label}» ناموفق بود:`, errText(error));
+      // A channel that could not be warmed is worth a second try on its next
+      // post: the failure is usually a cold session, not a permanent one.
+      this.warmed.delete(key);
+      return false;
+    }
+  }
+
+  /** The channel itself, by id or — when that fails — by the stored username. */
+  async entityOf(chatKey, username = '') {
+    try {
+      return await this.client.getInputEntity(chatKey);
+    } catch (error) {
+      const handle = String(username || '').trim().replace(/^@+/, '');
+      if (!handle) throw error;
+      return this.client.getInputEntity(`@${handle}`);
     }
   }
 }
