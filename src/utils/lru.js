@@ -32,6 +32,19 @@ export class LruSet {
     return false;
   }
 
+  /**
+   * Forgets `key`, so the next `add()` of it reports a first sighting again.
+   *
+   * Dedupe is normally permanent — that is the point — but a claim staked before
+   * the work succeeded has to be releasable, or a single failed attempt blocks
+   * every retry Telegram would have handed us for free on the next reconnect.
+   *
+   * @returns {boolean} true when the key was actually being tracked.
+   */
+  delete(key) {
+    return this.items.delete(key);
+  }
+
   get size() {
     return this.items.size;
   }
