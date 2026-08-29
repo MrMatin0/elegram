@@ -15,6 +15,20 @@ export const PLACEHOLDERS = Object.freeze(['title', 'link', 'id', 'date', 'text'
 const normalize = (value) => String(value ?? '').replace(/\r\n?/g, '\n').trim();
 
 /**
+ * Cuts to `limit` UTF-16 units — the unit Telegram counts — without splitting a
+ * surrogate pair.
+ *
+ * A blind `slice` can leave a lone high surrogate at the end, which is not a
+ * truncated emoji but an invalid string: the server rejects the whole message,
+ * so the comment that was one character too long became no comment at all.
+ */
+function cut(value, limit) {
+  if (value.length <= limit) return value;
+  const lone = /[\uD800-\uDBFF]/.test(value[limit - 1]);
+  return value.slice(0, lone ? limit - 1 : limit).trimEnd();
+}
+
+/**
  * Splits `<target> <body>` in every shape a human types it:
  *
  *   .comment @channel | اولین کامنت
@@ -72,6 +86,5 @@ export function renderComment(template, info = {}) {
     const key = String(name).toLowerCase();
     return Object.hasOwn(values, key) ? values[key] : match;
   });
-  const body = filled.trim();
-  return body.length > COMMENT_LIMIT ? body.slice(0, COMMENT_LIMIT) : body;
+  return cut(filled.trim(), COMMENT_LIMIT);
 }

@@ -55,6 +55,18 @@ const chatOf = (msg) => {
   }
 };
 
+/**
+ * Who posted a message, as a bare channel id, or '' for anything that is not a
+ * channel. Same defensive shape as `chatOf`: an unresolved peer can throw.
+ */
+const senderChannel = (msg) => {
+  try {
+    return bare(msg?.senderId ?? msg?.fromId?.channelId ?? '');
+  } catch {
+    return '';
+  }
+};
+
 /** A broadcast *post*, not just any message that happened to arrive from here. */
 export function isChannelPost(msg) {
   if (!msg) return false;
@@ -99,7 +111,6 @@ export class FirstCommentService {
     attempts = 12,
     join = true,
     timezone,
-    myId = '',
     report = true,
     pollMs = 150,
     timeoutMs = 10000,
@@ -113,7 +124,6 @@ export class FirstCommentService {
     this.attempts = Math.max(1, Number(attempts) || 1);
     this.join = Boolean(join);
     this.timezone = timezone;
-    this.myId = idStr(myId);
     this.report = Boolean(report);
     this.pollMs = Math.min(POLL_MAX_MS, Math.max(POLL_MIN_MS, Number(pollMs) || POLL_MIN_MS));
     this.timeoutMs = Math.max(1000, Number(timeoutMs) || 1000);
@@ -184,6 +194,17 @@ export class FirstCommentService {
     }
   }
 
+  /** The next gap in the ladder, capped so a long run cannot drift into seconds. */
+  nextGap(gap) {
+    return Math.min(POLL_MAX_MS, Math.round(gap * POLL_GROWTH));
+  }
+
+  /** Caches a channel's linked group. First writer wins; they all agree anyway. */
+  noteGroup(channelKey, peer, groupKey) {
+    if (!channelKey || !peer || this.groups.has(channelKey)) return;
+    this.groups.set(channelKey, { peer, chatKey: marked(groupKey) });
+  }
+
   // -------------------------------------------------------- the copy fast path
 
   key(chatKey, postId) {
@@ -214,17 +235,46 @@ export class FirstCommentService {
     if (!source || !postId) return;
     const chatKey = marked(source);
     if (!this.store.isFirstComment(chatKey)) return;
+    if (!this.isLinkedCopy(msg, chatKey, source)) return;
     const key = this.key(chatKey, postId);
     if (this.copies.has(key)) return;
-    void this.indexCopy(key, msg);
+    void this.indexCopy(key, msg, chatKey);
+  }
+
+  /**
+   * Is this really *the* copy, or just a forward that carries the same stamp?
+   *
+   * `savedFromPeer`/`savedFromMsgId` are written on every forward of a channel
+   * post, not only on the automatic one — so a member of a watched channel
+   * re-posting today's announcement into an unrelated group used to be indexed
+   * as the comment target, and the first comment landed in a chat the user never
+   * named. Two independent facts identify the genuine copy:
+   *
+   *   · it lives in *that channel's* linked group, which warm-up (or the first
+   *     successful lookup) has already taught us;
+   *   · it is posted **by the channel itself**, while a human forward is posted
+   *     by the human.
+   *
+   * The group is the stronger signal, so it decides on its own when known. The
+   * sender covers the window before it is — a channel enabled mid-run, or
+   * `FIRST_COMMENT_WARM=false`.
+   */
+  isLinkedCopy(msg, chatKey, source) {
+    const group = this.groups.get(chatKey);
+    if (group) return bare(group.chatKey) === bare(msg.chatId);
+    return senderChannel(msg) === source;
   }
 
   /** Records the copy and hands it to whoever is already waiting for it. */
-  async indexCopy(key, msg) {
+  async indexCopy(key, msg, channelKey = '') {
     const peer = await this.peerOf(msg);
     if (!peer) return;
-    const target = { peer, chatKey: idStr(msg.chatId), msgId: msg.id, pushed: true };
+    const groupKey = marked(msg.chatId);
+    const target = { peer, chatKey: groupKey, msgId: msg.id, pushed: true };
     this.copies.set(key, target);
+    // Learning the linked group from a live copy costs nothing and is what makes
+    // the guard above exact for every *next* post of the same channel.
+    this.noteGroup(channelKey, peer, groupKey);
     const list = this.waiters.get(key);
     if (!list) return;
     this.waiters.delete(key);
@@ -311,7 +361,7 @@ export class FirstCommentService {
       // A channel enabled after startup has never been warmed. Do it in the
       // background — this post takes the polling path, the next one will not.
       this.warmLater(chatKey, title);
-      return await this.comment(msg, { chatKey, title, link, body, at: Date.now() });
+      return await this.comment(msg, { chatKey, title, link, body, dedupe, at: Date.now() });
     } catch (error) {
       log.error('[comment] پردازش پست ناموفق بود:', errText(error));
       return null;
@@ -319,7 +369,7 @@ export class FirstCommentService {
   }
 
   /** Resolve the thread, write the comment, report. Never throws. */
-  async comment(msg, { chatKey, title, link, body, at = Date.now() }) {
+  async comment(msg, { chatKey, title, link, body, dedupe = '', at = Date.now() }) {
     // The optional "look human" delay is served *while* the thread is being
     // resolved, not before it: waiting is not a reason to postpone a lookup.
     const [thread] = await Promise.all([
@@ -332,6 +382,10 @@ export class FirstCommentService {
 
     if (!thread) {
       this.stats.failed += 1;
+      // Release the dedupe claim. Nothing was sent, so there is nothing to
+      // duplicate — and "the copy never showed up" is exactly the failure a
+      // replayed update (Telegram re-sends after every reconnect) can still fix.
+      if (dedupe) this.seen.delete(dedupe);
       log.warn(`[comment] گروه گفتگوی «${title}» پیدا نشد؛ کامنت گذاشته نشد.`);
       void this.say(cards.commentFailedCard({
         title,
@@ -348,6 +402,8 @@ export class FirstCommentService {
     } catch (error) {
       this.stats.failed += 1;
       const reason = errText(error);
+      // Deliberately *not* released: a send that threw may still have reached
+      // Telegram, and a duplicate comment is worse than a missing one.
       log.warn(`[comment] ارسال کامنت در «${title}» ناموفق بود:`, reason);
       void this.say(cards.commentFailedCard({
         title,
@@ -389,23 +445,44 @@ export class FirstCommentService {
     const known = this.copies.get(key);
     if (known) return known;
 
-    const peer = await this.peerOf(msg);
+    // Started before the first await: the budget is a wall-clock deadline for the
+    // whole search, not for whatever is left once setup has had its share.
     const deadline = Date.now() + this.timeoutMs;
+    const channelKey = marked(msg.chatId);
+    const peer = await this.peerOf(msg);
     let gap = this.pollMs;
+
+    // When we already know the linked group we are almost certainly inside it,
+    // and then the copy is coming to us on the update stream. Telegram writes it
+    // *after* publishing the post, so a lookup fired right now is guaranteed to
+    // answer "no such message": spend the first gap listening instead of paying
+    // a round trip for an answer we can predict.
+    if (this.groups.has(channelKey)) {
+      const early = await this.waitForCopy(key, Math.min(gap, Math.max(0, deadline - Date.now())));
+      if (early) return early;
+      gap = this.nextGap(gap);
+    }
 
     for (let attempt = 0; attempt < this.attempts; attempt += 1) {
       const pushed = this.copies.get(key);
       if (pushed) return pushed;
+      if (Date.now() >= deadline) break;
       try {
+        // `retries: 0` on purpose: withRetry's backoff starts at a full second
+        // and doubles, which inside a ladder measured in milliseconds would eat
+        // the entire deadline in a single attempt. This loop *is* the retry.
         const found = await withRetry(
           () => this.client.invoke(new Api.messages.GetDiscussionMessage({ peer, msgId: msg.id })),
-          { label: 'getDiscussionMessage', retries: 1 },
+          { label: 'getDiscussionMessage', retries: 0 },
         );
         const thread = (found?.messages ?? []).find(isReal);
         const target = thread ? this.threadPeer(found, thread, msg.chatId) : null;
         if (target) {
           const resolved = { peer: target.peer, chatKey: target.chatKey, msgId: thread.id };
           this.copies.set(key, resolved);
+          // The lookup just told us where the linked group is; remember it so the
+          // next post of this channel takes the listening path above.
+          this.noteGroup(channelKey, target.peer, target.chatKey);
           return resolved;
         }
       } catch (error) {
@@ -418,7 +495,7 @@ export class FirstCommentService {
       if (left <= 0) break;
       const waited = await this.waitForCopy(key, Math.min(gap, left));
       if (waited) return waited;
-      gap = Math.min(POLL_MAX_MS, Math.round(gap * POLL_GROWTH));
+      gap = this.nextGap(gap);
     }
     return this.copies.get(key) ?? null;
   }
@@ -492,8 +569,13 @@ export class FirstCommentService {
     const entries = this.store.firstCommentEntries();
     if (!entries.length) return 0;
     let ready = 0;
+    let seen = 0;
     for (const [chatKey, entry] of entries) {
-      if (ready) await sleep(WARM_GAP_MS);
+      // A gap between every pair of channels, not only after a success: a run of
+      // channels that all fail to resolve is precisely the burst that earns a
+      // FLOOD_WAIT, and it used to be the one case that got no gap at all.
+      if (seen) await sleep(WARM_GAP_MS);
+      seen += 1;
       if (await this.warmChannel(chatKey, entry?.title, entry?.username)) ready += 1;
     }
     if (ready) log.info(`[comment] گروه گفتگوی ${ready} کانال آماده شد؛ کامنت اول بدون تأخیر می‌رود.`);
