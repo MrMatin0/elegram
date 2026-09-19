@@ -315,13 +315,11 @@ export function createCommandHandler(ctx) {
      *   `.save <link>` — the post link, for channels with forwarding disabled,
      *                    where there is nothing of ours to reply to.
      *
-     * Outside the archive chat the command is deleted before any network work
-     * and every card is written to the archive chat, so a group is left clean.
+     * Outside the archive chat the command is deleted and every card is written
+     * to the archive chat, so a group is left clean.
      */
     [cmd('save')]: async (msg, args) => {
       const local = inArchiveChat(msg);
-      // Delete first, talk later: the trace must vanish even if the save fails.
-      if (!local) await removeMessage(msg);
       const say = (text) => openCard(msg, text, local);
 
       const argument = args.join(' ').trim();
@@ -330,6 +328,9 @@ export function createCommandHandler(ctx) {
 
       if (argument) {
         // An explicit link outranks a reply: it is the more deliberate target.
+        // A link carries its own target, so the command can still be wiped
+        // before any lookup happens.
+        if (!local) await removeMessage(msg);
         const found = await resolveLinkedMessage(client, argument);
         if (found.failure) {
           await say(cards.linkError(found.failure));
@@ -338,8 +339,14 @@ export function createCommandHandler(ctx) {
         anchor = found.message;
         peer = found.peer;
       } else {
+        // Read the reply target *before* deleting the command. teleproto
+        // resolves it through our own message id (InputMessageReplyTo), and the
+        // server no longer knows that id once the message is gone — deleting
+        // first turned every plain `.save` reply outside the archive chat into
+        // "nothing to save".
         anchor = await msg.getReplyMessage().catch(() => null);
         if (anchor) peer = await peerOf(msg);
+        if (!local) await removeMessage(msg);
       }
 
       if (!anchor) {
