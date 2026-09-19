@@ -77,17 +77,25 @@ export function registerHandlers(ctx, config) {
   /** Media archiving: TTL always, plus every chat that is auto-saved or mirrored. */
   const onIncoming = (msg, chatKey) => {
     if (!msg?.media) return;
-    if (seen.add(`${chatKey || '?'}|${msg.id}`)) return;
+    const key = `${chatKey || '?'}|${msg.id}`;
 
     // TTL media is archived unconditionally and jumps the queue: the whole
     // point of this project is winning the race against the self-destruct timer.
     if (isSelfDestruct(msg)) {
+      if (seen.add(key)) return;
       enqueue([msg], true);
       return;
     }
     // A mirrored chat implies its media: a deleted photo is worth as much as a
     // deleted sentence.
+    //
+    // Checked *before* the dedupe key is claimed, and that order matters: a
+    // message we are not archiving must not be marked as seen. Claiming it
+    // meant that switching auto-save or mirror on later, while the same message
+    // was still inside the LRU window, made its replayed update look like a
+    // duplicate — and it was then never archived at all.
     if (!store.isWatched(chatKey)) return;
+    if (seen.add(key)) return;
     if (msg.groupedId != null) {
       albums.push(`${chatKey}|${idStr(msg.groupedId)}`, msg);
       return;
@@ -214,7 +222,7 @@ export function registerHandlers(ctx, config) {
     queue.close('خاموشی سرویس');
   };
 
-  log.ok('هندلرها فعال شدند — منتطر پیام‌ها…');
+  log.ok('هندلرها فعال شدند — منتظر پیام‌ها…');
   if (store.mirrorCount) {
     log.info(`آینه فعال روی ${store.mirrorCount} چت${watching ? '' : ' (بدون رهگیری ویرایش/حذف)'}`);
   }

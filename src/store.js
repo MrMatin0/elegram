@@ -301,8 +301,13 @@ export class Store {
     this.save();
   }
 
+  /**
+   * Counter-only, and deliberately 0-safe: `Math.max(1, …)` here used to turn
+   * `countFailure(0)` into a phantom failure, so a partially failed batch could
+   * report more failures than it had items.
+   */
   countFailure(count = 1) {
-    this.data.stats.failed += Math.max(1, Math.floor(num(count, 1)));
+    this.data.stats.failed += Math.max(0, Math.floor(num(count, 1)));
     this.save();
   }
 }
